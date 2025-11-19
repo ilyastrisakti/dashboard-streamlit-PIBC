@@ -212,6 +212,8 @@ def preprocess_data_from_excel(uploaded_file):
     else:
         df_masuk_long = pd.DataFrame(columns=['tanggal', 'lokasi', 'masuk'])
 
+    
+
     # Standardization for Delivery
     if df_delivery is not None:
         date_col_del = next((c for c in df_delivery.columns if c in ('tanggal', 'date')), None)
@@ -316,7 +318,6 @@ def create_geo_map(df_flow, geo_lookup, flow_type='masuk'):
     unmatched = df_flow[df_flow['lokasi_norm'].isin(geo_lookup['lokasi_norm']) == False]
     if len(unmatched) > 0:
         st.warning(f"Ada lokasi yang tidak dikenali. {unmatched['lokasi'].unique()}")
-
 
     # Aggregate flow by location
     df_agg = df_flow.groupby('lokasi')[flow_type].sum().reset_index()
@@ -743,7 +744,7 @@ def render_main_ui():
                     )
                 else:
                     st.warning("Data tidak cukup untuk regresi.")
-                    
+
     # --- TAB 5: Peramalan (Existing Feature) ---
     with tabs[4]:
         st.subheader("Peramalan Stok (Forecasting)")
