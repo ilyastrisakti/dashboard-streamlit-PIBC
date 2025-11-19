@@ -376,7 +376,6 @@ def calculate_regression(df_stock, df_price, rice_type):
         'df': df_merge
     }
 
-
 # -------------------------
 # 4. UI Rendering
 # -------------------------
