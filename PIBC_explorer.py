@@ -247,11 +247,17 @@ def create_price_heatmap(df_price):
         return None
     
     corr = df_price.corr()
-    fig = px.imshow(corr, 
-                    text_auto=".2f", 
-                    aspect="auto", 
+    fig = px.imshow(corr,
+                    text_auto=True,
+                    aspect="auto",
                     color_continuous_scale='RdYlGn',
                     title="Heatmap Korelasi Harga Antar Jenis Beras")
+    # Force two-decimal formatting for the annotation text on the heatmap trace
+    try:
+        if fig.data and hasattr(fig.data[0], 'texttemplate'):
+            fig.data[0].texttemplate = "%{z:.2f}"
+    except Exception:
+        pass
     return fig
 
 # Feature: Volatility Analysis
@@ -336,19 +342,36 @@ def create_stock_distribution(df_stock):
 # Feature: Regression Stats
 def calculate_regression(df_stock, df_price, rice_type):
     if df_stock is None or df_price is None: return None
-    
-    # Merge
+
+    # Normalize/prepare price dataframe
     df_p = price_df_with_tanggal(df_price)
+    # Ensure df_p is valid and contains the rice_type column
+    if df_p is None or rice_type not in df_p.columns:
+        logger.warning(f"calculate_regression: price data missing or rice_type '{rice_type}' not found.")
+        return None
+
+    # Ensure df_stock has a 'tanggal' column (try resetting index if needed)
+    if 'tanggal' not in df_stock.columns:
+        df_stock = df_stock.reset_index()
+        # Rename first column to 'tanggal' if it isn't already
+        if df_stock.columns[0].lower() != 'tanggal':
+            df_stock = df_stock.rename(columns={df_stock.columns[0]: 'tanggal'})
+
+    # Ensure tanggal columns are datetime
+    df_stock['tanggal'] = pd.to_datetime(df_stock['tanggal'], errors='coerce')
+    df_p['tanggal'] = pd.to_datetime(df_p['tanggal'], errors='coerce')
+
+    # Merge safely
     df_merge = pd.merge(df_stock, df_p[['tanggal', rice_type]], on='tanggal', how='inner')
     df_merge.dropna(inplace=True)
-    
+
     if len(df_merge) < 2: return None
-    
+
     slope, intercept, r_value, p_value, std_err = linregress(df_merge['stok'], df_merge[rice_type])
-    
+
     return {
         'slope': slope,
-        'r2': r_value**2,
+        'r2': float(r_value) ** 2, # type: ignore
         'p_value': p_value,
         'df': df_merge
     }
@@ -401,10 +424,19 @@ def render_metrics(df_filtered):
     if df_filtered is None or df_filtered.empty: return
     
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Rata-rata Stok", f"{df_filtered['stok'].mean():,.0f} Ton")
-    col2.metric("Total Masuk", f"{df_filtered['masuk'].sum():,.0f} Ton")
-    col3.metric("Total Keluar", f"{df_filtered['keluar'].sum():,.0f} Ton")
-    col4.metric("Net Neraca", f"{df_filtered['neraca'].sum():,.0f} Ton")
+    
+    # Tambahkan parameter 'help' untuk tooltip
+    col1.metric("Rata-rata Stok", f"{df_filtered['stok'].mean():,.0f} Ton", 
+                help="Rata-rata stok harian yang tersedia di gudang dalam periode waktu yang dipilih.")
+                
+    col2.metric("Total Masuk", f"{df_filtered['masuk'].sum():,.0f} Ton", 
+                help="Total akumulasi volume beras yang masuk ke pasar.")
+                
+    col3.metric("Total Keluar", f"{df_filtered['keluar'].sum():,.0f} Ton", 
+                help="Total akumulasi volume beras yang didistribusikan keluar pasar.")
+                
+    col4.metric("Net Neraca", f"{df_filtered['neraca'].sum():,.0f} Ton", 
+                help="Selisih antara Total Masuk dikurangi Total Keluar. Positif = Surplus, Negatif = Defisit.")
 
 def render_main_ui():
     app_data = st.session_state.app_data
@@ -449,13 +481,38 @@ def render_main_ui():
 
     # --- TAB 1: Dashboard Utama ---
     with tabs[0]:
+
+        # Penjelasan Konsep Dasar Dashboard
+        with st.expander("ℹ️ Panduan Membaca Dashboard Utama (Klik untuk buka)", expanded=True):
+            st.markdown("""
+            * **Tren Stok Harian (Kiri):** Garis ini menunjukkan riwayat ketersediaan beras di gudang. 
+                * *Naik* = Penumpukan stok. *Turun* = Stok menipis (permintaan tinggi/pasokan kurang).
+            * **Neraca Harian (Kanan):** Membandingkan arus barang.
+                * **Batang Biru (Masuk):** Supply dari daerah.
+                * **Batang Merah (Keluar):** Distribusi ke pasar.
+                * **Titik Hitam (Net):** Surplus (di atas 0) atau Defisit (di bawah 0).
+            """)
+        
         col_a, col_b = st.columns(2)
         with col_a:
             st.plotly_chart(create_time_series(df_filt, 'stok', "Tren Stok Harian", "green"), use_container_width=True)
         with col_b:
             st.plotly_chart(create_balance_chart(df_filt), use_container_width=True)
-        
+
+        st.divider()
+
+        # Penjelasan Tren Harga
         if selected_rice and df_price_filt is not None:
+            with st.expander("ℹ️ Panduan Membaca Dashboard Utama (Klik untuk buka)", expanded=True):
+                st.markdown("""
+                * **Tren Stok Harian (Kiri):** Garis ini menunjukkan riwayat ketersediaan beras di gudang. 
+                    * *Naik* = Penumpukan stok. *Turun* = Stok menipis (permintaan tinggi/pasokan kurang).
+                * **Neraca Harian (Kanan):** Membandingkan arus barang.
+                    * **Batang Biru (Masuk):** Supply dari daerah.
+                    * **Batang Merah (Keluar):** Distribusi ke pasar.
+                    * **Titik Hitam (Net):** Surplus (di atas 0) atau Defisit (di bawah 0).
+                """)
+
             # Preprocess price data for plotting
             p_plot = df_price_filt[[selected_rice]].reset_index()
             p_plot.columns = ['tanggal', selected_rice]
@@ -464,8 +521,19 @@ def render_main_ui():
     # --- TAB 2: Peta Geografis (Feature from Notebook) ---
     with tabs[1]:
         st.subheader("Analisis Distribusi Geospasial")
-        geo_lookup = get_geo_lookup()
         
+        # Panduan membaca peta
+        st.markdown("""
+            <div style="background-color: #f0f2f6; padding: 10px; border-radius: 5px; font-size: 14px;">
+            ℹ️ <b>Panduan Peta:</b><br>
+            • <b>Lingkaran Besar:</b> Menandakan volume tonase beras yang lebih besar.<br>
+            • <b>Warna Pekat:</b> Konsentrasi tinggi pada satu titik lokasi.<br>
+            • <b>Interaksi:</b> Arahkan mouse ke lingkaran untuk melihat detail angka Tonase.
+            </div>
+            <br>
+            """, unsafe_allow_html=True)
+        
+        geo_lookup = get_geo_lookup()
         c1, c2 = st.columns(2)
         with c1:
             st.write("**Peta Asal Barang (Masuk)**")
@@ -490,12 +558,34 @@ def render_main_ui():
         
         # 1. Inventory Cover
         st.markdown("##### 1. Inventory Cover Days")
+        
+        # Expander untuk penjelasan rumus
+        with st.expander("📖 Cara Membaca Inventory Cover (Klik disini)"):
+            st.markdown("""
+            **Definisi:** Estimasi berapa hari stok saat ini akan bertahan jika tidak ada pasokan baru.
+            
+            $$
+            \\text{Cover Days} = \\frac{\\text{Stok Hari Ini}}{\\text{Rata-rata Keluar (7 hari terakhir)}}
+            $$
+            
+            **Panduan Indikator:**
+            * 🟢 **> 20 Hari:** Stok Aman.
+            * 🟡 **10 - 20 Hari:** Waspada.
+            * 🔴 **< 10 Hari:** Kritis (Risiko kelangkaan tinggi).
+            """)
+
         st.caption("Berapa hari stok saat ini mampu menutupi rata-rata permintaan keluar (Rolling 7 hari)?")
         fig_cover = create_inventory_cover_chart(df_filt)
         if fig_cover: st.plotly_chart(fig_cover, use_container_width=True)
         
         # 2. Volatility
         st.markdown("##### 2. Volatilitas Stok & Harga")
+        st.info("""
+        **Apa itu Volatilitas?**
+        Ini mengukur "kepanikan" pasar. Grafik yang **tinggi** menunjukkan harga/stok berubah-ubah secara drastis (tidak stabil) dalam waktu singkat.
+        Grafik yang **rendah/datar** menunjukkan kondisi pasar yang tenang dan stabil.
+        """)
+
         c_vol1, c_vol2 = st.columns(2)
         with c_vol1:
             fig_v_stok = create_volatility_chart(df_filt, 'stok', window=30, title="Volatilitas Stok (30 Hari)")
@@ -507,9 +597,19 @@ def render_main_ui():
                 fig_v_price = create_volatility_chart(p_reset, selected_rice, window=7, title=f"Volatilitas Harga {selected_rice} (7 Hari)")
                 if fig_v_price: st.plotly_chart(fig_v_price, use_container_width=True)
 
-        # 3. Heatmap
-        st.markdown("##### 3. Korelasi Antar Harga Beras")
-        if df_price_filt is not None:
+        st.divider()
+
+    # 3. Heatmap
+    st.markdown("### 3. Korelasi Antar Jenis Beras")
+    with st.expander("📖 Cara Membaca Heatmap (Matriks Warna)"):
+            st.markdown("""
+            Matriks ini menunjukkan hubungan pergerakan harga antar jenis beras:
+            * **Warna Hijau Tua (Mendekati 1.0):** Hubungan Kuat & Searah. Jika Beras A naik, Beras B **pasti ikut naik**. (Contoh: IR-64 I dan IR-64 II).
+            * **Warna Merah (Mendekati -1.0):** Hubungan Terbalik. Jika Beras A naik, Beras B justru turun.
+            * **Warna Pucat (Mendekati 0):** Tidak ada hubungan. Pergerakan harga mereka tidak saling mempengaruhi.
+            """)
+        
+    if df_price_filt is not None:
             fig_corr = create_price_heatmap(df_price_filt)
             if fig_corr: st.plotly_chart(fig_corr, use_container_width=True)
 
@@ -521,6 +621,13 @@ def render_main_ui():
         
         with col_stat1:
             st.markdown("#### Distribusi Stok")
+            # Penjelasan Ditribusi
+            st.caption("""
+            Grafik ini menjawab: **"Berapa level stok yang paling sering terjadi (Normal)?"**
+            * **Puncak Gunung (Modus):** Menunjukkan level stok yang paling sering terjadi sehari-hari.
+            * **Lebar Gunung:** Menunjukkan variasi stok. Semakin lebar, semakin tidak pasti ketersediaan stok di gudang.
+            """)
+
             fig_dist = create_stock_distribution(df_filt)
             if fig_dist: st.plotly_chart(fig_dist, use_container_width=True)
             
@@ -533,6 +640,14 @@ def render_main_ui():
             if selected_rice:
                 reg_res = calculate_regression(df_filt, df_price, selected_rice)
                 if reg_res:
+                    # Penjelasan interpretasi hasil
+                    st.info(f"💡 **Interpretasi:** Setiap stok bertambah **1 Ton**, harga diprediksi berubah sebesar **Rp {reg_res['slope']:.2f}**.")
+                    
+                    with st.expander("🔍 Penjelasan Istilah Statistik"):
+                        st.markdown("""
+                        * **R-Squared (0-1):** Seberapa kuat stok mempengaruhi harga? (Makin dekat ke 1, makin kuat).
+                        * **P-Value:** Tingkat kepercayaan. Jika angka ini **< 0.05**, berarti hubungan stok & harga adalah **Nyata (Signifikan)**, bukan kebetulan.
+                        """)
                     st.info(f"Formula: Harga = {reg_res['slope']:.2f} * Stok + Intercept")
                     
                     m1, m2, m3 = st.columns(3)
@@ -565,6 +680,14 @@ def render_main_ui():
     # --- TAB 5: Peramalan (Existing Feature) ---
     with tabs[4]:
         st.subheader("Peramalan Stok (Forecasting)")
+
+        # Tips memilih algoritma
+        st.success("""
+        🤖 **Tips Memilih Algoritma:**
+        * Pilih **Prophet** jika data Anda memiliki tren jangka panjang yang kuat atau banyak data libur nasional.
+        * Pilih **Holt-Winters** jika pola data Anda berulang secara mingguan/bulanan yang sangat teratur.
+        """)
+
         if len(df_filt) > 10:
             method = st.radio("Metode", ["Prophet", "Holt-Winters"], horizontal=True)
             days = st.slider("Horizon Hari", 7, 90, 30)
