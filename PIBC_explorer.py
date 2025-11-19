@@ -145,6 +145,23 @@ def load_data_from_db(_engine):
         df_stock = df_main[["tanggal", "stok"]].copy()
         df_masuk = df.groupby(["tanggal"])['masuk'].sum().reset_index() # Placeholder structure
         df_keluar = df.groupby(["tanggal"])['keluar'].sum().reset_index() # Placeholder structure
+        # ========= PATCH: Normalisasi kolom lokasi dari DB =========
+        # df_masuk
+        if 'lokasi' not in df_masuk.columns:
+            kemungkinan = [c for c in df_masuk.columns if c.lower() in ['lokasi','place','place_name','asal','lokasi_masuk']]
+            if kemungkinan:
+                df_masuk = df_masuk.rename(columns={kemungkinan[0]: 'lokasi'})
+            else:
+                df_masuk['lokasi'] = 'Unknown'
+
+        # df_keluar
+        if 'lokasi' not in df_keluar.columns:
+            kemungkinan = [c for c in df_keluar.columns if c.lower() in ['lokasi','place','place_name','asal','lokasi_keluar']]
+            if kemungkinan:
+                df_keluar = df_keluar.rename(columns={kemungkinan[0]: 'lokasi'})
+            else:
+                df_keluar['lokasi'] = 'Unknown'
+        # ========= END PATCH =========
         df_price = df.pivot_table(index='tanggal', columns='nama_jenis', values='harga', aggfunc='mean')
         
         return df_main, df_stock, df_masuk, df_keluar, df_price
@@ -163,23 +180,58 @@ def preprocess_data_from_excel(uploaded_file):
             df.columns = [_clean_colname(c).lower() for c in df.columns]
         return df
 
+    def _find_date_col(df):
+        if df is None or df.columns.size == 0:
+            return None
+        # common names first
+        for c in df.columns:
+            if str(c).lower() in ('tanggal','date','tgl','hari'):
+                return c
+        # dtype-based detection
+        for c in df.columns:
+            try:
+                if np.issubdtype(df[c].dtype, np.datetime64):
+                    return c
+            except Exception:
+                continue
+        # fallback to first column
+        return df.columns[0]
+
     df_stock = get_clean_sheet('rice_stock')
     df_delivery = get_clean_sheet('rice_delivery')
     df_source = get_clean_sheet('rice_source')
-    df_price_raw = data.get('rice_price') # Keep original case for columns
+    df_price_raw = data.get('rice_price') # keep original case for columns and clean later
 
     if df_stock is None:
         return None, None, None, None, None
 
     # Fix Price Data
+    df_price = None
     if df_price_raw is not None:
+        # clean column names but keep date detection robust
         df_price_raw.columns = [_clean_colname(c) for c in df_price_raw.columns]
-        # Find date column
-        date_col = next((c for c in df_price_raw.columns if c.lower() in ('date', 'tanggal')), None)
-        if date_col:
+        date_col = None
+        # try by name
+        date_col = next((c for c in df_price_raw.columns if str(c).lower() in ('date','tanggal','tgl','day')), None)
+        # fallback by dtype or first column
+        if date_col is None:
+            for c in df_price_raw.columns:
+                try:
+                    if np.issubdtype(df_price_raw[c].dtype, np.datetime64):
+                        date_col = c
+                        break
+                except Exception:
+                    continue
+        if date_col is None:
+            date_col = df_price_raw.columns[0] if df_price_raw.columns.size > 0 else None
+
+        if date_col is not None:
             df_price_raw[date_col] = pd.to_datetime(df_price_raw[date_col], errors='coerce')
             df_price_raw = df_price_raw.set_index(date_col)
             df_price_raw.index.name = 'tanggal'
+            # ensure index is datetime
+            df_price_raw.index = pd.to_datetime(df_price_raw.index, errors='coerce')
+        df_price = df_price_raw.copy()
 
     # Fix Stock Data
     date_col_stock = next((c for c in df_stock.columns if c in ('tanggal', 'date', 'tgl')), df_stock.columns[0])
@@ -191,45 +243,77 @@ def preprocess_data_from_excel(uploaded_file):
         if c not in df_stock.columns:
             # Try to find mapping or create 0
             found = next((x for x in df_stock.columns if c in x), None)
-            if found: df_stock.rename(columns={found: c}, inplace=True)
-            else: df_stock[c] = 0
+            if found:
+                df_stock.rename(columns={found: c}, inplace=True)
+            else:
+                df_stock[c] = 0
 
     df_main = df_stock[['tanggal', 'stok', 'masuk', 'keluar']].copy()
     df_main['neraca'] = df_main['masuk'] - df_main['keluar']
 
-    # Process Source/Delivery for Maps
-    # Standardization for Source
+    # ===== FINAL PATCH: LONG FORMAT UNTUK GEO MAP =====
+    # ----- SOURCE (MASUK) -----
     if df_source is not None:
-        date_col_src = next((c for c in df_source.columns if c in ('tanggal', 'date')), None)
-        if date_col_src:
+        date_col_src = next((c for c in df_source.columns if c in ('tanggal','date')), None)
+        if date_col_src is None:
+            df_source['tanggal'] = pd.NaT
+        else:
             df_source[date_col_src] = pd.to_datetime(df_source[date_col_src], errors='coerce')
-            df_source.rename(columns={date_col_src: 'tanggal'}, inplace=True)
-            val_cols = [c for c in df_source.columns if c != 'tanggal']
-            df_masuk_long = df_source.melt(id_vars='tanggal', value_vars=val_cols, var_name='lokasi', value_name='masuk')
+            df_source = df_source.rename(columns={date_col_src:'tanggal'})
+
+        val_cols_src = [c for c in df_source.columns if c != 'tanggal']
+
+        if val_cols_src:
+            df_masuk_long = df_source.melt(
+                id_vars='tanggal',
+                value_vars=val_cols_src,
+                var_name='lokasi',
+                value_name='masuk'
+            )
+            df_masuk_long['lokasi'] = df_masuk_long['lokasi'].astype(str).str.strip()
+            df_masuk_long['lokasi_norm'] = df_masuk_long['lokasi'].str.lower()
+            df_masuk_long['masuk'] = pd.to_numeric(df_masuk_long['masuk'], errors='coerce').fillna(0)
             df_masuk_long = df_masuk_long[df_masuk_long['masuk'] > 0]
         else:
-            df_masuk_long = pd.DataFrame(columns=['tanggal', 'lokasi', 'masuk'])
+            df_masuk_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','masuk'])
     else:
-        df_masuk_long = pd.DataFrame(columns=['tanggal', 'lokasi', 'masuk'])
+        df_masuk_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','masuk'])
 
-    
 
-    # Standardization for Delivery
+    # ----- DELIVERY (KELUAR) -----
     if df_delivery is not None:
-        date_col_del = next((c for c in df_delivery.columns if c in ('tanggal', 'date')), None)
-        if date_col_del:
+        date_col_del = next((c for c in df_delivery.columns if c in ('tanggal','date')), None)
+        if date_col_del is None:
+            df_delivery['tanggal'] = pd.NaT
+        else:
             df_delivery[date_col_del] = pd.to_datetime(df_delivery[date_col_del], errors='coerce')
-            df_delivery.rename(columns={date_col_del: 'tanggal'}, inplace=True)
-            val_cols = [c for c in df_delivery.columns if c != 'tanggal']
-            df_keluar_long = df_delivery.melt(id_vars='tanggal', value_vars=val_cols, var_name='lokasi', value_name='keluar')
+            df_delivery = df_delivery.rename(columns={date_col_del:'tanggal'})
+
+        val_cols_del = [c for c in df_delivery.columns if c != 'tanggal']
+
+        if val_cols_del:
+            df_keluar_long = df_delivery.melt(
+                id_vars='tanggal',
+                value_vars=val_cols_del,
+                var_name='lokasi',
+                value_name='keluar'
+            )
+            df_keluar_long['lokasi'] = df_keluar_long['lokasi'].astype(str).str.strip()
+            df_keluar_long['lokasi_norm'] = df_keluar_long['lokasi'].str.lower()
+            df_keluar_long['keluar'] = pd.to_numeric(df_keluar_long['keluar'], errors='coerce').fillna(0)
             df_keluar_long = df_keluar_long[df_keluar_long['keluar'] > 0]
         else:
-            df_keluar_long = pd.DataFrame(columns=['tanggal', 'lokasi', 'keluar'])
+            df_keluar_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','keluar'])
     else:
-        df_keluar_long = pd.DataFrame(columns=['tanggal', 'lokasi', 'keluar'])
+        df_keluar_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','keluar'])
 
-    return df_main, df_stock, df_masuk_long, df_keluar_long, df_price_raw
+    # Final safety: ensure tanggal datetime in long tables
+    if not df_masuk_long.empty:
+        df_masuk_long['tanggal'] = pd.to_datetime(df_masuk_long['tanggal'], errors='coerce')
+    if not df_keluar_long.empty:
+        df_keluar_long['tanggal'] = pd.to_datetime(df_keluar_long['tanggal'], errors='coerce')
 
+    return df_main, df_stock, df_masuk_long, df_keluar_long, df_price
 # -------------------------
 # 3. Visualization Logic
 # -------------------------
@@ -309,30 +393,40 @@ def create_inventory_cover_chart(df_main):
 def create_geo_map(df_flow, geo_lookup, flow_type='masuk'):
     if df_flow is None or df_flow.empty: return None
 
-    # Normalize location column
-    df_flow['lokasi_norm'] = df_flow['lokasi'].str.strip().str.lower()
-    geo_lookup['lokasi_norm'] = geo_lookup['lokasi'].str.strip().str.lower()
-    df_flow = df_flow.merge(geo_lookup, on='lokasi_norm', how='inner')
+    # ===== FINAL PATCH GEO MAP: NORMALISASI DAN MERGE PADA lokasi_norm =====
+    geo_lookup = geo_lookup.copy()
+    geo_lookup['lokasi_norm'] = geo_lookup['lokasi'].astype(str).str.lower().str.strip()
+    # keep original lookup label
+    geo_lookup = geo_lookup.rename(columns={'lokasi': 'lokasi_lookup'})
 
-    # show warning for unmatched locations
-    unmatched = df_flow[df_flow['lokasi_norm'].isin(geo_lookup['lokasi_norm']) == False]
-    if len(unmatched) > 0:
-        st.warning(f"Ada lokasi yang tidak dikenali. {unmatched['lokasi'].unique()}")
+    df_flow = df_flow.copy()
+    # Ensure lokasi column exists (preprocess makes it)
+    if 'lokasi' not in df_flow.columns:
+        df_flow['lokasi'] = 'Unknown'
+    df_flow['lokasi_norm'] = df_flow['lokasi'].astype(str).str.lower().str.strip()
 
-    # Aggregate flow by location
-    df_agg = df_flow.groupby('lokasi')[flow_type].sum().reset_index()
-    
-    # Merge with Lat/Lon
-    df_map = pd.merge(df_agg, geo_lookup, on='lokasi', how='inner')
-    
-    if df_map.empty: return None
-    
+    # Merge on normalized name
+    df_map = df_flow.merge(geo_lookup, on='lokasi_norm', how='inner')
+
+    if df_map.empty:
+        st.warning("Tidak ada lokasi yang cocok dengan geo lookup.")
+        return None
+    # ===== END PATCH =====
+
+    # Aggregate flow by lokasi_norm (sum) then attach lat/lon & readable lokasi label
+    df_agg = df_map.groupby('lokasi_norm')[flow_type].sum().reset_index()
+    df_agg = df_agg.merge(geo_lookup, on='lokasi_norm', how='left')
+    # use lokasi_lookup (nice display) if available, else use original lokasi
+    df_agg['lokasi_display'] = df_agg['lokasi_lookup'].fillna(df_agg['lokasi_norm'])
+
+    if df_agg.empty: return None
+
     title = "Peta Asal Beras (Masuk)" if flow_type == 'masuk' else "Peta Distribusi Beras (Keluar)"
     color_scale = "Greens" if flow_type == 'masuk' else "Reds"
-    
+
     fig = px.scatter_mapbox(
-        df_map, lat="lat", lon="lon", size=flow_type, color=flow_type,
-        hover_name="lokasi", hover_data=[flow_type],
+        df_agg, lat="lat", lon="lon", size=flow_type, color=flow_type,
+        hover_name="lokasi_display", hover_data=[flow_type],
         title=title,
         color_continuous_scale=color_scale,
         zoom=5, center={"lat": -6.8, "lon": 108},
@@ -463,20 +557,11 @@ def render_sidebar():
         if source == "Upload Excel":
             f = st.file_uploader("Upload File (.xlsx)", type=["xlsx"])
             if f:
-                df_main, df_stock, df_masuk, df_keluar, df_price = preprocess_data_from_excel(f)
-                if df_main is not None:
-                    st.session_state.data_loaded = True
-                    st.session_state.app_data = {
-                        'df': df_main, 'df_stock': df_stock, 
-                        'df_masuk': df_masuk, 'df_keluar': df_keluar, 
-                        'df_price': df_price
-                    }
-                    st.rerun()
-        else:
-            if st.button("Connect DB"):
-                eng = init_connection()
-                if eng:
-                    df_main, df_stock, df_masuk, df_keluar, df_price = load_data_from_db(eng)
+                result = preprocess_data_from_excel(f)
+                if result is None:
+                    st.error("Gagal memproses file. Periksa struktur file (.xlsx) dan sheet yang diperlukan.")
+                else:
+                    df_main, df_stock, df_masuk, df_keluar, df_price = result
                     if df_main is not None:
                         st.session_state.data_loaded = True
                         st.session_state.app_data = {
@@ -485,6 +570,23 @@ def render_sidebar():
                             'df_price': df_price
                         }
                         st.rerun()
+        else:
+            if st.button("Connect DB"):
+                eng = init_connection()
+                if eng:
+                    result = load_data_from_db(eng)
+                    if result is None:
+                        st.error("Gagal memuat data dari database.")
+                    else:
+                        df_main, df_stock, df_masuk, df_keluar, df_price = result
+                        if df_main is not None:
+                            st.session_state.data_loaded = True
+                            st.session_state.app_data = {
+                                'df': df_main, 'df_stock': df_stock, 
+                                'df_masuk': df_masuk, 'df_keluar': df_keluar, 
+                                'df_price': df_price
+                            }
+                            st.rerun()
 
 def render_metrics(df_filtered):
     if df_filtered is None or df_filtered.empty: return
