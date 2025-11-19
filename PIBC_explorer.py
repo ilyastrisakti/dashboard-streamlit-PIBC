@@ -62,7 +62,8 @@ def price_df_with_tanggal(df_price: Optional[pd.DataFrame]) -> Optional[pd.DataF
     # Normalize columns to find date
     if isinstance(p.index, pd.DatetimeIndex) or (p.index.name and str(p.index.name).lower() == "tanggal"):
         p = p.reset_index()
-        p.rename(columns={p.columns[0]: "tanggal"}, inplace=True)
+        if 'index' in p.columns:
+            p = p.rename(columns={'index':'tanggal'})
     else:
         date_col = next((c for c in p.columns if c.lower() in ("date", "tanggal", "tgl", "hari")), None)
         if date_col:
@@ -132,14 +133,19 @@ def load_data_from_db(_engine):
         df["tanggal"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]].rename(columns={"YEAR": "year", "MONTH": "month", "DAY": "day"}), errors="coerce")
         
         # Aggregation Logic
-        df_main = df.groupby("tanggal").agg(masuk=("masuk", "first"), keluar=("keluar", "first"), stok=("stok", "first")).reset_index()
+        df_main = df.groupby("tanggal").agg(
+        masuk=("masuk","sum"),
+        keluar=("keluar","sum"),
+        stok=("stok","mean")
+        ).reset_index()
+
         df_main.fillna(0, inplace=True)
         df_main["neraca"] = df_main["masuk"] - df_main["keluar"]
         
         df_stock = df_main[["tanggal", "stok"]].copy()
         df_masuk = df.groupby(["tanggal"])['masuk'].sum().reset_index() # Placeholder structure
         df_keluar = df.groupby(["tanggal"])['keluar'].sum().reset_index() # Placeholder structure
-        df_price = df.pivot_table(index='tanggal', columns='nama_jenis', values='harga')
+        df_price = df.pivot_table(index='tanggal', columns='nama_jenis', values='harga', aggfunc='mean')
         
         return df_main, df_stock, df_masuk, df_keluar, df_price
     except Exception as e:
@@ -300,7 +306,18 @@ def create_inventory_cover_chart(df_main):
 # Feature: Geospatial Maps
 def create_geo_map(df_flow, geo_lookup, flow_type='masuk'):
     if df_flow is None or df_flow.empty: return None
-    
+
+    # Normalize location column
+    df_flow['lokasi_norm'] = df_flow['lokasi'].str.strip().str.lower()
+    geo_lookup['lokasi_norm'] = geo_lookup['lokasi'].str.strip().str.lower()
+    df_flow = df_flow.merge(geo_lookup, on='lokasi_norm', how='inner')
+
+    # show warning for unmatched locations
+    unmatched = df_flow[df_flow['lokasi_norm'].isin(geo_lookup['lokasi_norm']) == False]
+    if len(unmatched) > 0:
+        st.warning(f"Ada lokasi yang tidak dikenali. {unmatched['lokasi'].unique()}")
+
+
     # Aggregate flow by location
     df_agg = df_flow.groupby('lokasi')[flow_type].sum().reset_index()
     
@@ -367,11 +384,60 @@ def calculate_regression(df_stock, df_price, rice_type):
 
     if len(df_merge) < 2: return None
 
-    slope, intercept, r_value, p_value, std_err = linregress(df_merge['stok'], df_merge[rice_type])
+    # Use the full returned object from linregress to safely access fields
+    lr = linregress(df_merge['stok'], df_merge[rice_type])
+    # Extract slope/intercept
+    slope = getattr(lr, 'slope', lr[0] if len(lr) > 0 else None)
+    intercept = getattr(lr, 'intercept', lr[1] if len(lr) > 1 else None)
+
+    # Extract r-value robustly (handles namedtuple, tuple, or array-like)
+    # Use getattr to avoid direct attribute access issues in static analysis/stubs
+    r_val = getattr(lr, 'rvalue', None)
+    if r_val is None:
+        try:
+            r_val = lr[2]
+        except Exception:
+            r_val = None
+
+    # Safely convert to float and compute R-squared (more robust handling)
+    r2_val = None
+    if r_val is None:
+        r2_val = None
+    else:
+        r_float = None
+        # Try numpy conversion first
+        try:
+            arr = np.asarray(r_val)
+            # If arr is scalar-like, get item; if it's an array, try to extract a floatable element
+            if arr.size == 1:
+                r_float = float(arr.item())
+            else:
+                # pick first element and try to convert
+                r_float = float(arr.flat[0])
+        except Exception:
+            # Fallback: handle common iterable types
+            try:
+                if isinstance(r_val, (list, tuple)):
+                    r_float = float(r_val[0])
+                else:
+                    r_float = float(r_val) # type: ignore
+            except Exception:
+                r_float = None
+
+        if r_float is not None:
+            try:
+                r2_val = r_float ** 2
+            except Exception:
+                r2_val = None
+        else:
+            r2_val = None
+
+    p_value = getattr(lr, 'pvalue', lr[3] if len(lr) > 3 else None)
 
     return {
         'slope': slope,
-        'r2': float(r_value) ** 2, # type: ignore
+        'intercept': intercept,
+        'r2': r2_val,
         'p_value': p_value,
         'df': df_merge
     }
@@ -448,7 +514,9 @@ def render_main_ui():
     with st.sidebar:
         st.divider()
         st.subheader("Filter Dashboard")
-        min_date, max_date = df['tanggal'].min(), df['tanggal'].max()
+        min_ts = pd.to_datetime(df['tanggal'].min(), errors='coerce')
+        max_ts = pd.to_datetime(df['tanggal'].max(), errors='coerce')
+        min_date, max_date = min_ts.date(), max_ts.date()
         start_date = st.date_input("Mulai", min_date)
         end_date = st.date_input("Sampai", max_date)
         
@@ -675,7 +743,7 @@ def render_main_ui():
                     )
                 else:
                     st.warning("Data tidak cukup untuk regresi.")
-
+                    
     # --- TAB 5: Peramalan (Existing Feature) ---
     with tabs[4]:
         st.subheader("Peramalan Stok (Forecasting)")
@@ -692,7 +760,11 @@ def render_main_ui():
             days = st.slider("Horizon Hari", 7, 90, 30)
             
             df_fc = df_filt[['tanggal', 'stok']].rename(columns={'tanggal':'ds', 'stok':'y'})
-            
+
+            if len(df_fc) < 14:
+                st.error("Data terlalu sedikit untuk forecasting.")
+                st.stop()
+
             if method == "Prophet":
                 m = Prophet()
                 m.fit(df_fc)
@@ -721,7 +793,8 @@ def render_main_ui():
 
             else: # Holt Winters
                 try:
-                    model = ExponentialSmoothing(df_fc['y'], seasonal='add', seasonal_periods=7).fit()
+                    season = min(7, max(2, len(df_fc)//2))
+                    model = ExponentialSmoothing(df_fc['y'], seasonal='add', seasonal_periods=season).fit()
                     pred = model.forecast(days)
                     
                     # Create date range for forecast
