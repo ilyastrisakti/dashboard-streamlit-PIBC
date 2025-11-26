@@ -21,6 +21,25 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from st_aggrid import AgGrid, GridOptionsBuilder
 from streamlit_option_menu import option_menu
 
+from lib.utils import _clean_colname, price_df_with_tanggal, convert_df_to_csv
+from lib.data import (
+    get_geo_lookup,
+    init_connection,
+    load_data_from_db,
+    preprocess_data_from_excel
+)
+from lib.plots import (
+    DEFAULT_PLOTLY_TEMPLATE,
+    create_time_series,
+    create_balance_chart,
+    create_price_heatmap,
+    create_volatility_chart,
+    create_inventory_cover_chart,
+    create_stock_distribution,
+    create_regression_scatter,
+    create_geo_map
+)
+
 # --- Basic setup ---
 st.set_page_config(
     page_title="Dashboard Analisis PIBC 🌾",
@@ -41,10 +60,41 @@ st.markdown(
 .stTabs [data-baseweb="tab-list"] { gap: 10px; }
 .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; background-color: #f0f2f6; border-radius: 4px 4px 0 0; gap: 1px; padding-top: 10px; padding-bottom: 10px; }
 .stTabs [aria-selected="true"] { background-color: #2E86AB; color: white; }
+
+/* Dark theme tab overrides */
+[data-theme="dark"] .stTabs [data-baseweb="tab"] {
+    background-color: #0f1720 !important;
+    color: #cfeaf8 !important;
+    border-radius: 6px 6px 0 0;
+}
+[data-theme="dark"] .stTabs [aria-selected="true"] { background-color: #164f6b !important; color: #fff !important; }
+
+/* Guide / info boxes used across UI (works in both light & dark) */
+.guide-box {
+    background-color: #f0f2f6; 
+    color: #0b1a24;
+    padding: 12px;
+    border-radius: 8px;
+    font-size: 14px;
+    border: 1px solid rgba(0,0,0,0.06);
+}
+[data-theme="dark"] .guide-box {
+    background-color: #071025 !important;
+    color: #E6F2FF !important;
+    border: 1px solid rgba(255,255,255,0.06) !important;
+}
+
+/* Slight text boost for small UI pieces in dark mode */
+[data-theme="dark"] .stSmall, [data-theme="dark"] .stCaption {
+    color: #dbeeff !important;
+}
 </style>
 """,
     unsafe_allow_html=True,
 )
+
+# Choose plotly template based on Streamlit theme
+DEFAULT_PLOTLY_TEMPLATE = "plotly_dark" if st.get_option("theme.base") == "dark" else "plotly_white"
 
 # -------------------------
 # 1. Utilities / Helpers
@@ -79,21 +129,6 @@ def price_df_with_tanggal(df_price: Optional[pd.DataFrame]) -> Optional[pd.DataF
 def convert_df_to_csv(df) :
     """Mengubah DataFrame menjadi format CSV utf-8 agar bisa diunduh."""
     return df.to_csv(index=False).encode('utf-8')
-
-# --- New Helper: Geo Coordinates (Hardcoded from Notebook) ---
-@st.cache_data
-def get_geo_lookup():
-    """Returns a DataFrame with lat/lon for known locations."""
-    # Data from Notebook Feature 5
-    geo_data = {
-        'lokasi': ['Bandung', 'Banten', 'Bekasi', 'Bogor', 'Bulog', 'Cianjur', 
-                   'Cirebon', 'DKI', 'Jateng', 'Jatim', 'Karawang', 'Tangerang', 'Tj Priok'],
-        'lat': [-6.9175, -6.1200, -6.2383, -6.5950, -6.2568, -6.8207, 
-                -6.7061, -6.1751, -6.9667, -7.2575, -6.3290, -6.1781, -6.1044],
-        'lon': [107.6191, 106.1518, 106.9756, 106.7997, 106.8431, 107.1432, 
-                108.5570, 106.8272, 110.4167, 112.7521, 107.3007, 106.6300, 106.8835]
-    }
-    return pd.DataFrame(geo_data)
 
 # -------------------------
 # 2. Database & Loading
@@ -177,120 +212,131 @@ def preprocess_data_from_excel(uploaded_file):
     def get_clean_sheet(name):
         df = data.get(name)
         if df is not None:
-            df.columns = [_clean_colname(c).lower() for c in df.columns]
+            df = df.copy()
+            df.columns = [_clean_colname(c).strip() for c in df.columns]
+            # keep original case for value labels but provide lowercase helpers later
         return df
 
     def _find_date_col(df):
         if df is None or df.columns.size == 0:
             return None
-        # common names first
         for c in df.columns:
             if str(c).lower() in ('tanggal','date','tgl','hari'):
                 return c
-        # dtype-based detection
+        # dtype detection
         for c in df.columns:
             try:
                 if np.issubdtype(df[c].dtype, np.datetime64):
                     return c
             except Exception:
                 continue
-        # fallback to first column
         return df.columns[0]
 
+    # read raw sheets
     df_stock = get_clean_sheet('rice_stock')
     df_delivery = get_clean_sheet('rice_delivery')
     df_source = get_clean_sheet('rice_source')
-    df_price_raw = data.get('rice_price') # keep original case for columns and clean later
+    df_price_raw = get_clean_sheet('rice_price')  # may be None
 
     if df_stock is None:
         return None, None, None, None, None
 
-    # Fix Price Data
+    # --- PRICE processing (safe) ---
     df_price = None
     if df_price_raw is not None:
-        # clean column names but keep date detection robust
-        df_price_raw.columns = [_clean_colname(c) for c in df_price_raw.columns]
-        date_col = None
-        # try by name
-        date_col = next((c for c in df_price_raw.columns if str(c).lower() in ('date','tanggal','tgl','day')), None)
-        # fallback by dtype or first column
-        if date_col is None:
-            for c in df_price_raw.columns:
-                try:
-                    if np.issubdtype(df_price_raw[c].dtype, np.datetime64):
-                        date_col = c
-                        break
-                except Exception:
-                    continue
-        if date_col is None:
-            date_col = df_price_raw.columns[0] if df_price_raw.columns.size > 0 else None
-
-        if date_col is not None:
+        # normalize column names for price sheet (lower, no newlines)
+        df_price_raw = df_price_raw.copy()
+        df_price_raw.columns = [_clean_colname(c).lower() for c in df_price_raw.columns]
+        # detect date column
+        date_col = next((c for c in df_price_raw.columns if c in ('tanggal','date','tgl')), None)
+        if date_col is None and df_price_raw.shape[1] > 0:
+            date_col = df_price_raw.columns[0]
+        if date_col:
             df_price_raw[date_col] = pd.to_datetime(df_price_raw[date_col], errors='coerce')
-            df_price_raw = df_price_raw.set_index(date_col)
-            df_price_raw.index.name = 'tanggal'
-            # ensure index is datetime
-            df_price_raw.index = pd.to_datetime(df_price_raw.index, errors='coerce')
-        df_price = df_price_raw.copy()
-
-    # Fix Stock Data
-    date_col_stock = next((c for c in df_stock.columns if c in ('tanggal', 'date', 'tgl')), df_stock.columns[0])
-    df_stock[date_col_stock] = pd.to_datetime(df_stock[date_col_stock], errors='coerce')
-    df_stock.rename(columns={date_col_stock: 'tanggal'}, inplace=True)
-    
-    # Fix numeric columns in stock
-    for c in ['stok', 'masuk', 'keluar']:
-        if c not in df_stock.columns:
-            # Try to find mapping or create 0
-            found = next((x for x in df_stock.columns if c in x), None)
-            if found:
-                df_stock.rename(columns={found: c}, inplace=True)
+            # pivot if there is a rice type column and price column names exist
+            # try common column names
+            name_col = next((c for c in df_price_raw.columns if 'jenis' in c or 'type' in c or 'nama' in c), None)
+            price_col = next((c for c in df_price_raw.columns if 'harga' in c or 'price' in c or 'value' in c), None)
+            if name_col and price_col:
+                df_price = df_price_raw.pivot_table(index=date_col, columns=name_col, values=price_col, aggfunc='mean')
+                df_price.index.name = 'tanggal'
+                df_price.index = pd.to_datetime(df_price.index, errors='coerce')
             else:
-                df_stock[c] = 0
+                # fallback: treat entire sheet as timeseries, ensure index is datetime
+                df_price_raw = df_price_raw.set_index(date_col).sort_index()
+                df_price_raw.index.name = 'tanggal'
+                df_price_raw.index = pd.to_datetime(df_price_raw.index, errors='coerce')
+                df_price = df_price_raw.copy()
 
-    df_main = df_stock[['tanggal', 'stok', 'masuk', 'keluar']].copy()
-    df_main['neraca'] = df_main['masuk'] - df_main['keluar']
+    # --- STOCK processing ---
+    df_stock = df_stock.copy()
+    # normalize stock date column
+    date_col_stock = _find_date_col(df_stock)
+    df_stock[date_col_stock] = pd.to_datetime(df_stock[date_col_stock], errors='coerce')
+    df_stock = df_stock.rename(columns={date_col_stock: 'tanggal'})
+    # ensure numeric columns exist (stok, masuk, keluar) create fallback columns
+    lower_cols = {c.lower(): c for c in df_stock.columns}
+    # map to standard names if present
+    if 'stok' not in lower_cols and any('stok' in c.lower() for c in df_stock.columns):
+        pass
+    # Ensure numeric
+    for want in ['stok', 'masuk', 'keluar']:
+        # try to find a column that contains the name (case-insensitive)
+        found = next((c for c in df_stock.columns if want in c.lower()), None)
+        if found:
+            df_stock[want] = pd.to_numeric(df_stock[found], errors='coerce').fillna(0)
+        elif want not in df_stock.columns:
+            df_stock[want] = 0
 
-    # ===== FINAL PATCH: LONG FORMAT UNTUK GEO MAP =====
-    # ----- SOURCE (MASUK) -----
-    if df_source is not None:
-        date_col_src = next((c for c in df_source.columns if c in ('tanggal','date')), None)
-        if date_col_src is None:
-            df_source['tanggal'] = pd.NaT
-        else:
+    df_stock['tanggal'] = pd.to_datetime(df_stock['tanggal'], errors='coerce')
+    # Keep stok plus ensure tanggal datetime. We'll fill masuk/keluar later from source/delivery melts.
+    df_stock['tanggal'] = pd.to_datetime(df_stock['tanggal'], errors='coerce')
+    df_main = df_stock[['tanggal', 'stok']].copy()
+    # keep any existing stock-sheet masuk/keluar as fallback columns
+    if 'masuk' in df_stock.columns:
+        df_main['masuk_from_stock'] = pd.to_numeric(df_stock['masuk'], errors='coerce').fillna(0)
+    else:
+        df_main['masuk_from_stock'] = 0
+    if 'keluar' in df_stock.columns:
+        df_main['keluar_from_stock'] = pd.to_numeric(df_stock['keluar'], errors='coerce').fillna(0)
+    else:
+        df_main['keluar_from_stock'] = 0
+
+    # --- SOURCE (wide -> long) -----
+    if df_source is None:
+        df_masuk_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','masuk'])
+    else:
+        df_source = df_source.copy()
+        date_col_src = _find_date_col(df_source)
+        if date_col_src:
             df_source[date_col_src] = pd.to_datetime(df_source[date_col_src], errors='coerce')
-            df_source = df_source.rename(columns={date_col_src:'tanggal'})
+            df_source = df_source.rename(columns={date_col_src: 'tanggal'})
+        else:
+            df_source['tanggal'] = pd.NaT
 
         val_cols_src = [c for c in df_source.columns if c != 'tanggal']
-
         if val_cols_src:
-            df_masuk_long = df_source.melt(
-                id_vars='tanggal',
-                value_vars=val_cols_src,
-                var_name='lokasi',
-                value_name='masuk'
-            )
+            df_masuk_long = df_source.melt(id_vars='tanggal', value_vars=val_cols_src, var_name='lokasi', value_name='masuk')
             df_masuk_long['lokasi'] = df_masuk_long['lokasi'].astype(str).str.strip()
-            df_masuk_long['lokasi_norm'] = df_masuk_long['lokasi'].str.lower()
+            df_masuk_long['lokasi_norm'] = df_masuk_long['lokasi'].str.lower().str.strip()
             df_masuk_long['masuk'] = pd.to_numeric(df_masuk_long['masuk'], errors='coerce').fillna(0)
-            df_masuk_long = df_masuk_long[df_masuk_long['masuk'] > 0]
+            df_masuk_long = df_masuk_long[df_masuk_long['masuk'] > 0].reset_index(drop=True)
         else:
             df_masuk_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','masuk'])
+
+    # --- DELIVERY (wide -> long) -----
+    if df_delivery is None:
+        df_keluar_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','keluar'])
     else:
-        df_masuk_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','masuk'])
-
-
-    # ----- DELIVERY (KELUAR) -----
-    if df_delivery is not None:
-        date_col_del = next((c for c in df_delivery.columns if c in ('tanggal','date')), None)
-        if date_col_del is None:
-            df_delivery['tanggal'] = pd.NaT
-        else:
+        df_delivery = df_delivery.copy()
+        date_col_del = _find_date_col(df_delivery)
+        if date_col_del:
             df_delivery[date_col_del] = pd.to_datetime(df_delivery[date_col_del], errors='coerce')
-            df_delivery = df_delivery.rename(columns={date_col_del:'tanggal'})
+            df_delivery = df_delivery.rename(columns={date_col_del: 'tanggal'})
+        else:
+            df_delivery['tanggal'] = pd.NaT
 
         val_cols_del = [c for c in df_delivery.columns if c != 'tanggal']
-
         if val_cols_del:
             df_keluar_long = df_delivery.melt(
                 id_vars='tanggal',
@@ -299,20 +345,40 @@ def preprocess_data_from_excel(uploaded_file):
                 value_name='keluar'
             )
             df_keluar_long['lokasi'] = df_keluar_long['lokasi'].astype(str).str.strip()
-            df_keluar_long['lokasi_norm'] = df_keluar_long['lokasi'].str.lower()
+            df_keluar_long['lokasi_norm'] = df_keluar_long['lokasi'].str.lower().str.strip()
             df_keluar_long['keluar'] = pd.to_numeric(df_keluar_long['keluar'], errors='coerce').fillna(0)
             df_keluar_long = df_keluar_long[df_keluar_long['keluar'] > 0]
         else:
             df_keluar_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','keluar'])
+
+    # ----- AGGREGATE masuk/keluar per tanggal dan merge ke df_main -----
+    if not df_masuk_long.empty:
+        df_masuk_long['tanggal'] = pd.to_datetime(df_masuk_long['tanggal'], errors='coerce')
+        df_masuk_date = df_masuk_long.groupby('tanggal', as_index=False)['masuk'].sum()
     else:
-        df_keluar_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','keluar'])
+        df_masuk_date = pd.DataFrame(columns=['tanggal','masuk'])
+
+    if not df_keluar_long.empty:
+        df_keluar_long['tanggal'] = pd.to_datetime(df_keluar_long['tanggal'], errors='coerce')
+        df_keluar_date = df_keluar_long.groupby('tanggal', as_index=False)['keluar'].sum()
+    else:
+        df_keluar_date = pd.DataFrame(columns=['tanggal','keluar'])
+
+    # merge aggregated flows to df_main; if no flows exist, fall back to stock-sheet columns
+    df_main = df_main.merge(df_masuk_date, on='tanggal', how='left')
+    df_main = df_main.merge(df_keluar_date, on='tanggal', how='left')
+    # fill with fallback values from stock sheet if df_masuk/keluar aggregates are missing
+    df_main['masuk'] = pd.to_numeric(df_main['masuk'].fillna(df_main.get('masuk_from_stock', 0)), errors='coerce').fillna(0)
+    df_main['keluar'] = pd.to_numeric(df_main['keluar'].fillna(df_main.get('keluar_from_stock', 0)), errors='coerce').fillna(0)
+    # compute neraca
+    df_main['neraca'] = df_main['masuk'] - df_main['keluar']
 
     # Final safety: ensure tanggal datetime in long tables
     if not df_masuk_long.empty:
         df_masuk_long['tanggal'] = pd.to_datetime(df_masuk_long['tanggal'], errors='coerce')
     if not df_keluar_long.empty:
         df_keluar_long['tanggal'] = pd.to_datetime(df_keluar_long['tanggal'], errors='coerce')
-
+ 
     return df_main, df_stock, df_masuk_long, df_keluar_long, df_price
 # -------------------------
 # 3. Visualization Logic
@@ -321,7 +387,7 @@ def preprocess_data_from_excel(uploaded_file):
 # --- Original Visualizations ---
 def create_time_series(df, y_col, title, color=None):
     if df is None or df.empty or y_col not in df.columns: return go.Figure()
-    return px.line(df, x='tanggal', y=y_col, title=title, template='plotly_white', line_shape='spline', color_discrete_sequence=[color] if color else None)
+    return px.line(df, x='tanggal', y=y_col, title=title, template=DEFAULT_PLOTLY_TEMPLATE, line_shape='spline', color_discrete_sequence=[color] if color else None)
 
 def create_balance_chart(df):
     if df is None or df.empty: return go.Figure()
@@ -329,7 +395,7 @@ def create_balance_chart(df):
     fig.add_trace(go.Bar(x=df['tanggal'], y=df['masuk'], name='Masuk', marker_color='#2E86AB'))
     fig.add_trace(go.Bar(x=df['tanggal'], y=-df['keluar'], name='Keluar', marker_color='#F24236'))
     fig.add_trace(go.Scatter(x=df['tanggal'], y=df['neraca'], name='Neraca', line=dict(color='black', width=2, dash='dot')))
-    return fig.update_layout(title='Neraca Harian (Masuk vs Keluar)', barmode='relative', template='plotly_white')
+    return fig.update_layout(title='Neraca Harian (Masuk vs Keluar)', barmode='relative', template=DEFAULT_PLOTLY_TEMPLATE)
 
 # --- NEW VISUALIZATIONS (From Notebook) ---
 
@@ -743,7 +809,7 @@ def render_main_ui():
         
         # Panduan membaca peta
         st.markdown("""
-            <div style="background-color: #f0f2f6; padding: 10px; border-radius: 5px; font-size: 14px;">
+            <div class="guide-box">
             ℹ️ <b>Panduan Peta:</b><br>
             • <b>Lingkaran Besar:</b> Menandakan volume tonase beras yang lebih besar.<br>
             • <b>Warna Pekat:</b> Konsentrasi tinggi pada satu titik lokasi.<br>
@@ -977,5 +1043,7 @@ def main():
     else:
         render_main_ui()
 
+from app.ui import run_app
+
 if __name__ == "__main__":
-    main()
+    run_app()
