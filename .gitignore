@@ -1,0 +1,8 @@
+# Ignore VSCode settings
+.vscode/
+
+# Ignore Streamlit settings
+.streamlit/
+
+# Ignore stenv
+stenv/

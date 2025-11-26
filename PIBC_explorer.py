@@ -571,22 +571,71 @@ def render_sidebar():
                         }
                         st.rerun()
         else:
-            if st.button("Connect DB"):
+            st.markdown("## Koneksi Database")
+            st.caption("Gunakan st.secrets jika tersedia, atau isi form manual di bawah.")
+
+            # Try using st.secrets first (button)
+            try:
+                secret_defaults = st.secrets.get("connections", {}).get("mysql_db", {})
+            except Exception:
+                secret_defaults = {}
+
+            if st.button("Connect using st.secrets"):
                 eng = init_connection()
-                if eng:
-                    result = load_data_from_db(eng)
-                    if result is None:
-                        st.error("Gagal memuat data dari database.")
-                    else:
-                        df_main, df_stock, df_masuk, df_keluar, df_price = result
-                        if df_main is not None:
-                            st.session_state.data_loaded = True
-                            st.session_state.app_data = {
-                                'df': df_main, 'df_stock': df_stock, 
-                                'df_masuk': df_masuk, 'df_keluar': df_keluar, 
-                                'df_price': df_price
-                            }
-                            st.rerun()
+                if eng is None:
+                    st.error("st.secrets tidak ditemukan / konfigurasi salah. Coba koneksi manual di bawah.")
+                else:
+                    with st.spinner("Menghubungkan via st.secrets..."):
+                        result = load_data_from_db(eng)
+                        if result is None:
+                            st.error("Gagal memuat data dari database. Periksa konfigurasi atau izin DB.")
+                        else:
+                            df_main, df_stock, df_masuk, df_keluar, df_price = result
+                            if df_main is not None:
+                                st.session_state.data_loaded = True
+                                st.session_state.app_data = {
+                                    'df': df_main, 'df_stock': df_stock,
+                                    'df_masuk': df_masuk, 'df_keluar': df_keluar,
+                                    'df_price': df_price
+                                }
+                                st.success("Connected & data loaded from DB.")
+                                st.rerun()
+
+            st.markdown("---")
+            st.markdown("### Manual connection (jika st.secrets tidak dipakai)")
+            host = st.text_input("Host", value=secret_defaults.get("host", "localhost"))
+            port = st.text_input("Port", value=str(secret_defaults.get("port", "3306")))
+            user = st.text_input("User", value=secret_defaults.get("username", ""), help="DB username")
+            password = st.text_input("Password", value=secret_defaults.get("password", ""), type="password")
+            database = st.text_input("Database", value=secret_defaults.get("database", ""))
+
+            if st.button("Connect (Manual)"):
+                if not all([host, port, user, password, database]):
+                    st.error("Lengkapi semua field koneksi terlebih dahulu.")
+                else:
+                    conn_str = f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{database}"
+                    try:
+                        eng_manual = create_engine(conn_str)
+                        # quick test query
+                        with eng_manual.connect() as conn:
+                            conn.execute(text("SELECT 1"))
+                        with st.spinner("Mengambil data dari database..."):
+                            result = load_data_from_db(eng_manual)
+                            if result is None:
+                                st.error("Gagal memuat data dari database. Cek query atau hak akses.")
+                            else:
+                                df_main, df_stock, df_masuk, df_keluar, df_price = result
+                                if df_main is not None:
+                                    st.session_state.data_loaded = True
+                                    st.session_state.app_data = {
+                                        'df': df_main, 'df_stock': df_stock,
+                                        'df_masuk': df_masuk, 'df_keluar': df_keluar,
+                                        'df_price': df_price
+                                    }
+                                    st.success("Connected & data loaded from DB (manual).")
+                                    st.rerun()
+                    except Exception as e:
+                        st.error(f"Koneksi gagal: {e}")
 
 def render_metrics(df_filtered):
     if df_filtered is None or df_filtered.empty: return
