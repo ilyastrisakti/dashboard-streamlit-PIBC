@@ -1,16 +1,24 @@
 import pandas as pd
 import numpy as np
-from typing import Optional
+from typing import Optional, Dict, Any
 from scipy.stats import linregress
 import logging
 from .constants import COL_TANGGAL, COL_STOK
 
 def _clean_colname(c: Optional[str]) -> str:
+    """
+    Cleans a column name by removing newlines and stripping whitespace.
+    Returns an empty string if the input is None.
+    """
     if c is None:
         return ""
     return str(c).replace("\n", " ").strip()
 
 def price_df_with_tanggal(df_price: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """
+    Ensures the price DataFrame has a 'tanggal' column of datetime type.
+    It intelligently finds the date column, renames it, and converts its type.
+    """
     if df_price is None:
         return None
     p = df_price.copy()
@@ -29,11 +37,12 @@ def price_df_with_tanggal(df_price: Optional[pd.DataFrame]) -> Optional[pd.DataF
     return p
 
 def convert_df_to_csv(df: pd.DataFrame) -> bytes:
+    """Converts a DataFrame to a UTF-8 encoded CSV byte string for downloading."""
     return df.to_csv(index=False).encode('utf-8')
 
-def calculate_regression(df_stock: pd.DataFrame, df_price: pd.DataFrame, rice_type: str):
+def calculate_regression(df_stock: pd.DataFrame, df_price: pd.DataFrame, rice_type: str) -> Optional[Dict[str, Any]]:
     """
-    Calculates linear regression between stock and price for a specific rice type.
+    Calculates linear regression between stock level and the price of a specific rice type.
     Returns a dictionary with regression stats and the merged dataframe.
     """
     logger = logging.getLogger(__name__)
@@ -55,7 +64,10 @@ def calculate_regression(df_stock: pd.DataFrame, df_price: pd.DataFrame, rice_ty
     df_merge = pd.merge(df_stock, df_p[[COL_TANGGAL, rice_type]], on=COL_TANGGAL, how='inner')
     df_merge.dropna(inplace=True)
 
-    if len(df_merge) < 2: return None
+    # Linear regression requires at least 2 data points. Let's use a safer threshold.
+    if len(df_merge) < 5:
+        logger.warning(f"Not enough data points ({len(df_merge)}) for a meaningful regression.")
+        return None
 
     lr = linregress(df_merge[COL_STOK], df_merge[rice_type])
     

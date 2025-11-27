@@ -7,7 +7,8 @@ from .utils import _clean_colname
 from .constants import *
 
 @st.cache_data
-def get_geo_lookup():
+def get_geo_lookup() -> pd.DataFrame:
+    """Returns a DataFrame with location names, latitudes, and longitudes."""
     geo_data = {
         COL_LOKASI: ['Bandung', 'Banten', 'Bekasi', 'Bogor', 'Bulog', 'Cianjur', 
                    'Cirebon', 'DKI', 'Jateng', 'Jatim', 'Karawang', 'Tangerang', 'Tj Priok'],
@@ -19,7 +20,8 @@ def get_geo_lookup():
     return pd.DataFrame(geo_data)
 
 @st.cache_resource(ttl=3600)
-def init_connection():
+def init_connection() -> Optional[object]:
+    """Initializes a database connection using credentials from st.secrets."""
     try:
         db_config = st.secrets["connections"]["mysql_db"]
         conn = (f"mysql+mysqlconnector://{db_config['username']}:{db_config['password']}@"
@@ -30,6 +32,10 @@ def init_connection():
 
 @st.cache_data(ttl=600)
 def load_data_from_db(_engine) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    """
+    Loads and processes data from the database.
+    Returns a tuple of DataFrames: (df_main, df_stock, df_masuk, df_keluar, df_price).
+    """
     if _engine is None:
         return None, None, None, None, None
     # Using constants for column aliases
@@ -68,12 +74,16 @@ def load_data_from_db(_engine) -> Tuple[Optional[pd.DataFrame], Optional[pd.Data
 
 @st.cache_data(ttl=3600)
 def preprocess_data_from_excel(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    # (kept same robust implementation used sebelumnya: baca sheet, wide->long, aggregate merge)
+    """
+    Reads an uploaded Excel file, processes multiple sheets, and returns structured data.
+    Handles wide-to-long transformation for source/delivery data and merges everything.
+    Returns a tuple of DataFrames: (df_main, df_stock, df_masuk, df_keluar, df_price).
+    """
     data = pd.read_excel(uploaded_file, sheet_name=None)
     def get_clean_sheet(name):
         df = data.get(name)
         if df is not None:
-            df = df.copy()
+            df = df.copy() # Make a copy to avoid modifying the original cache
             df.columns = [_clean_colname(c).strip() for c in df.columns]
         return df
 

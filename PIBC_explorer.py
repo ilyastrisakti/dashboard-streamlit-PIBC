@@ -16,9 +16,9 @@ import plotly.figure_factory as ff # Added for KDE Distribution
 import streamlit as st
 from prophet import Prophet
 from sqlalchemy import create_engine, text
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from st_aggrid import AgGrid, GridOptionsBuilder
 from streamlit_option_menu import option_menu
+from streamlit_plotly_events import plotly_events
 
 from lib.constants import *
 from lib.utils import price_df_with_tanggal, convert_df_to_csv, calculate_regression
@@ -28,12 +28,16 @@ from lib.data import (
     load_data_from_db,
     preprocess_data_from_excel
 )
+from lib.bussiness_logic import (
+    filter_and_aggregate_data
+)
 from lib.plots import (
     DEFAULT_PLOTLY_TEMPLATE,
     create_time_series,
     create_balance_chart,
     create_price_heatmap,
     create_volatility_chart,
+    create_regression_scatter,
     create_inventory_cover_chart,
     create_stock_distribution, # create_regression_scatter is not used directly, but calculate_regression is
     create_geo_map
@@ -48,6 +52,7 @@ st.set_page_config(
 )
 
 warnings.filterwarnings("ignore")
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -98,13 +103,6 @@ DEFAULT_PLOTLY_TEMPLATE = "plotly_dark" if st.get_option("theme.base") == "dark"
 # -------------------------
 # 3. Visualization Logic
 # -------------------------
-
-# --- Original Visualizations ---
-def create_time_series(df, y_col, title, color=None):
-    if df is None or df.empty or y_col not in df.columns: return go.Figure()
-    # This function is now imported from lib.plots, but the definition was here.
-    # We keep the call but remove the local definition.
-    return px.line(df, x=COL_TANGGAL, y=y_col, title=title, template=DEFAULT_PLOTLY_TEMPLATE, line_shape='spline', color_discrete_sequence=[color] if color else None)
 
 # -------------------------
 # 4. UI Rendering
@@ -229,12 +227,53 @@ def render_metrics(df_filtered):
     col4.metric("Net Neraca", f"{df_filtered[COL_NERACA].sum():,.0f} Ton", 
                 help="Selisih antara Total Masuk dikurangi Total Keluar. Positif = Surplus, Negatif = Defisit.")
 
+def handle_drilldown(points):
+    """Handles the logic when a user clicks a point on a chart for drill-down."""
+    if not points:
+        return
+
+    # Get the date from the first clicked point
+    clicked_date = pd.to_datetime(points[0]["x"])
+
+    # Store the drill-down context in session state
+    st.session_state.drilldown_context = {
+        "date": clicked_date,
+        "from_granularity": st.session_state.get('granularity_selector', 'Harian')
+    }
+
+def reset_date_filters():
+    """Resets date filters in session state, forcing them to use data min/max."""
+    if 'start_date_filter' in st.session_state:
+        del st.session_state['start_date_filter']
+    if 'end_date_filter' in st.session_state:
+        del st.session_state['end_date_filter']
 def render_main_ui():
     app_data = st.session_state.app_data
     df = app_data['df']
     df_price = app_data.get('df_price') # Use .get() for safety
     df_masuk = app_data[COL_MASUK]
     df_keluar = app_data[COL_KELUAR]
+
+    # --- Handle Drill-down State Change ---
+    if 'drilldown_context' in st.session_state and st.session_state.drilldown_context:
+        context = st.session_state.drilldown_context
+        from_granularity = context['from_granularity']
+        clicked_date = context['date']
+
+        if from_granularity == "Tahunan":
+            st.session_state.granularity_selector = "Bulanan"
+            # Set date range for the entire selected year
+            st.session_state.start_date_filter = pd.Timestamp(year=clicked_date.year, month=1, day=1).date()
+            st.session_state.end_date_filter = pd.Timestamp(year=clicked_date.year, month=12, day=31).date()
+        elif from_granularity == "Bulanan":
+            st.session_state.granularity_selector = "Harian"
+            # Set date range for the entire selected month
+            st.session_state.start_date_filter = clicked_date.replace(day=1).date()
+            st.session_state.end_date_filter = (clicked_date + pd.offsets.MonthEnd(0)).date()
+        
+        # Clear the context to prevent re-triggering
+        st.session_state.drilldown_context = None
+
 
     # --- Sidebar Filters ---
     with st.sidebar:
@@ -243,51 +282,36 @@ def render_main_ui():
         min_ts = pd.to_datetime(df['tanggal'].min(), errors='coerce')
         max_ts = pd.to_datetime(df['tanggal'].max(), errors='coerce')
         min_date, max_date = (min_ts.date() if pd.notna(min_ts) else None, max_ts.date() if pd.notna(max_ts) else None)
-        start_date = st.date_input("Mulai", min_date) # Let Streamlit handle None
-        end_date = st.date_input("Sampai", max_date)
+        start_date = st.date_input("Mulai", value=st.session_state.get('start_date_filter', min_date), key='start_date_filter')
+        end_date = st.date_input("Sampai", value=st.session_state.get('end_date_filter', max_date), key='end_date_filter')
         
         rice_opts = list(df_price.columns) if df_price is not None else []
         selected_rice = st.selectbox("Jenis Beras (untuk Harga)", rice_opts) if rice_opts else None
 
         st.divider()
-        granularity = st.radio("Tingkat Agregasi Data", ["Harian", "Bulanan", "Tahunan"], key="granularity_selector")
-        
+        granularity = st.radio("Tingkat Agregasi Data", ["Harian", "Bulanan", "Tahunan"], key="granularity_selector", help="Klik pada bar/titik di grafik utama untuk melakukan 'drill-down' ke level yang lebih detail.", on_change=reset_date_filters)
+            
         if granularity != "Harian":
             st.caption(f"💡 Filter tanggal akan diterapkan pada level {granularity.lower()}.")
 
     is_daily_view = (granularity == "Harian")
 
-    # --- Filtering ---
-    mask = (df['tanggal'].dt.date >= start_date) & (df['tanggal'].dt.date <= end_date)
-    df_filt = df[mask]
-    
+    # --- Performant Data Processing ---
+    # Call the new cached function to get the aggregated data
+    df_agg = filter_and_aggregate_data(df, start_date, end_date, granularity)
+
+    # Filter geo and price data (these are usually smaller and less costly)
     df_masuk_filt = df_masuk[(df_masuk[COL_TANGGAL].dt.date >= start_date) & (df_masuk[COL_TANGGAL].dt.date <= end_date)] if df_masuk is not None and not df_masuk.empty else pd.DataFrame()
     df_keluar_filt = df_keluar[(df_keluar[COL_TANGGAL].dt.date >= start_date) & (df_keluar[COL_TANGGAL].dt.date <= end_date)] if df_keluar is not None and not df_keluar.empty else pd.DataFrame()
     
     df_price_filt = None
     if df_price is not None:
-        df_price_filt = df_price[(df_price.index.date >= start_date) & (df_price.index.date <= end_date)]
-
-    # --- Aggregation Logic based on Granularity ---
-    if is_daily_view:
-        df_agg = df_filt.copy()
-    else:
-        # Set tanggal as index for resampling
-        df_to_resample = df_filt.set_index('tanggal')
-        
-        resample_rule = 'M' if granularity == "Bulanan" else 'Y'
-        
-        # Define aggregation rules
-        agg_rules = {
-            COL_STOK: 'mean',
-            COL_MASUK: 'sum',
-            COL_KELUAR: 'sum',
-            COL_NERACA: 'sum'
-        }
-        
-        df_agg = df_to_resample.resample(resample_rule).agg(agg_rules).reset_index()
-        # Rename the resampled date column back to 'tanggal'
-        df_agg = df_agg.rename(columns={'index': 'tanggal'})
+        # Ensure df_price index is timezone-naive before comparing with date objects
+        if df_price.index.tz is not None:
+            price_index_date = df_price.index.tz_localize(None).date
+        else:
+            price_index_date = df_price.index.date
+        df_price_filt = df_price[(price_index_date >= start_date) & (price_index_date <= end_date)]
 
     # --- UI Layout ---
     render_metrics(df_agg)
@@ -317,17 +341,40 @@ def render_main_ui():
         
         col_a, col_b = st.columns(2)
         with col_a:
-            st.plotly_chart(create_time_series(df_agg, COL_STOK, f"Tren Stok {granularity}", "green"), use_container_width=True, key="main_stok_ts")
+            fig_stok = create_time_series(df_agg, COL_STOK, f"Tren Stok {granularity}", "green", is_daily=is_daily_view)
+            # Always use plotly_events to maintain state across tab switches.
+            # The component can handle an empty figure. override_height should be int or None.
+            # Setting it to a default int value if None is not explicitly allowed by the component.
+            clicked_points_stok = plotly_events(fig_stok, click_event=bool(fig_stok.data), key="stok_events", override_height=400, override_width="100%")
+            handle_drilldown(clicked_points_stok)
+
         with col_b:
-            st.plotly_chart(create_balance_chart(df_agg), use_container_width=True, key="main_balance_chart")
+            fig_balance = create_balance_chart(df_agg, granularity=granularity)
+            clicked_points_balance = plotly_events(fig_balance, click_event=bool(fig_balance.data), key="balance_events", override_height=None, override_width="100%")
+            handle_drilldown(clicked_points_balance)
 
         st.divider()
 
-        if selected_rice and df_price_filt is not None:
-            # Preprocess price data for plotting
-            p_plot = df_price_filt[[selected_rice]].reset_index()
-            p_plot.columns = [COL_TANGGAL, selected_rice]
-            st.plotly_chart(create_time_series(p_plot, selected_rice, f"Tren Harga: {selected_rice}", "blue"), use_container_width=True, key="main_price_ts")
+        if selected_rice:
+            st.markdown(f"#### Tren Harga: {selected_rice}")
+            st.markdown("""
+            <div class="guide-box">
+            Grafik ini menunjukkan pergerakan harga historis untuk jenis beras yang Anda pilih di sidebar. Gunakan ini untuk mengidentifikasi periode inflasi (kenaikan harga), deflasi (penurunan harga), dan membandingkannya secara visual dengan tren stok dan neraca di atas.
+            </div>
+            """, unsafe_allow_html=True)
+
+        if selected_rice and df_price_filt is not None and not df_price_filt.empty:
+            # Aggregate price data to match the main granularity
+            if not is_daily_view:
+                resample_rule = 'M' if granularity == "Bulanan" else 'Y'
+                df_price_agg = df_price_filt[[selected_rice]].resample(resample_rule).mean()
+            else:
+                df_price_agg = df_price_filt[[selected_rice]]
+            
+            if not df_price_agg.empty:
+                p_plot = df_price_agg.reset_index()
+                p_plot = p_plot.rename(columns={'index': COL_TANGGAL})
+                st.plotly_chart(create_time_series(p_plot, selected_rice, f"Tren Harga {granularity}: {selected_rice}", "blue", is_daily=is_daily_view), use_container_width=True, key="main_price_ts")
 
     # --- TAB 2: Peta Geografis (Feature from Notebook) ---
     with tabs[1]:
@@ -454,9 +501,18 @@ def render_main_ui():
             fig_dist = create_stock_distribution(df_agg)
             if fig_dist: st.plotly_chart(fig_dist, use_container_width=True, key="stock_distribution_chart")
             
-            st.write("Statistik Deskriptif Stok:")
+            st.markdown("---")
+            st.markdown("#### Statistik Deskriptif Stok")
             desc = df_agg[COL_STOK].describe()
             st.dataframe(desc)
+            with st.expander("📖 Panduan Membaca Tabel Statistik Deskriptif"):
+                st.markdown("""
+                * **count:** Jumlah total periode (hari/bulan/tahun) yang dianalisis.
+                * **mean (Rata-rata):** Level stok rata-rata selama periode tersebut. Ini adalah gambaran umum ketersediaan.
+                * **std (Standar Deviasi):** Ukuran volatilitas stok. Angka yang **tinggi** berarti level stok sangat bervariasi (tidak stabil). Angka yang **rendah** berarti stok cenderung konsisten.
+                * **min & max:** Level stok terendah dan tertinggi yang pernah tercatat dalam periode waktu yang dipilih.
+                * **25%, 50% (Median), 75%:** Kuartil yang membagi data. Contohnya, '50%' (median) adalah nilai tengah; 50% dari waktu, stok berada di bawah angka ini.
+                """)
 
         with col_stat2:
             st.markdown(f"#### Regresi: Stok vs Harga ({selected_rice})")
