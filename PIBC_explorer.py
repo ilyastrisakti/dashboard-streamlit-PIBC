@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Merged PIBC Explorer
+PIBC Explorer final
 - Base: preprod_PIBC_explorer.py
 - New Features: DataXplorPIBC_1 (1).ipynb (Geo, Volatility, Heatmap, Regression, Inventory Cover)
 """
@@ -15,13 +15,13 @@ import plotly.graph_objects as go
 import plotly.figure_factory as ff # Added for KDE Distribution
 import streamlit as st
 from prophet import Prophet
-from scipy.stats import pearsonr, linregress # Added linregress
 from sqlalchemy import create_engine, text
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from st_aggrid import AgGrid, GridOptionsBuilder
 from streamlit_option_menu import option_menu
 
-from lib.utils import _clean_colname, price_df_with_tanggal, convert_df_to_csv
+from lib.constants import *
+from lib.utils import price_df_with_tanggal, convert_df_to_csv, calculate_regression
 from lib.data import (
     get_geo_lookup,
     init_connection,
@@ -35,8 +35,7 @@ from lib.plots import (
     create_price_heatmap,
     create_volatility_chart,
     create_inventory_cover_chart,
-    create_stock_distribution,
-    create_regression_scatter,
+    create_stock_distribution, # create_regression_scatter is not used directly, but calculate_regression is
     create_geo_map
 )
 
@@ -97,511 +96,15 @@ st.markdown(
 DEFAULT_PLOTLY_TEMPLATE = "plotly_dark" if st.get_option("theme.base") == "dark" else "plotly_white"
 
 # -------------------------
-# 1. Utilities / Helpers
-# -------------------------
-
-def _clean_colname(c: Optional[str]) -> str:
-    if c is None: return ""
-    return str(c).replace("\n", " ").strip()
-
-def price_df_with_tanggal(df_price: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
-    if df_price is None: return None
-    p = df_price.copy()
-    p.columns = [_clean_colname(c) for c in p.columns]
-    
-    # Normalize columns to find date
-    if isinstance(p.index, pd.DatetimeIndex) or (p.index.name and str(p.index.name).lower() == "tanggal"):
-        p = p.reset_index()
-        if 'index' in p.columns:
-            p = p.rename(columns={'index':'tanggal'})
-    else:
-        date_col = next((c for c in p.columns if c.lower() in ("date", "tanggal", "tgl", "hari")), None)
-        if date_col:
-            p = p.rename(columns={date_col: "tanggal"})
-        else:
-            # Fallback: try index coercion
-            p["tanggal"] = pd.to_datetime(p.index, errors="coerce")
-    
-    p["tanggal"] = pd.to_datetime(p["tanggal"], errors="coerce")
-    return p
-
-@st.cache_data
-def convert_df_to_csv(df) :
-    """Mengubah DataFrame menjadi format CSV utf-8 agar bisa diunduh."""
-    return df.to_csv(index=False).encode('utf-8')
-
-# -------------------------
-# 2. Database & Loading
-# -------------------------
-@st.cache_resource(ttl=3600)
-def init_connection():
-    try:
-        db_config = st.secrets["connections"]["mysql_db"]
-        connection_string = (
-            f"mysql+mysqlconnector://{db_config['username']}:{db_config['password']}@"
-            f"{db_config['host']}:{db_config['port']}/{db_config['database']}"
-        )
-        return create_engine(connection_string)
-    except Exception:
-        return None
-
-@st.cache_data(ttl=600)
-def load_data_from_db(_engine):
-    if _engine is None: return None, None, None, None, None
-    
-    query = text("""
-        SELECT d.YEAR, d.MONTH, d.DAY, fio.TOTAL_WEIGHT_INCOME AS masuk, 
-        fio.TOTAL_WEIGHT_OUTCOME AS keluar, fio.WEIGHT_STOCK AS stok, fh.PRICE AS harga,
-        drt.RICE_TYPE_NAME AS nama_jenis, dm.MARKET_NAME
-        FROM dim_date d
-        LEFT JOIN fact_rice_income_outcome fio ON d.SK = fio.SK_DATE
-        LEFT JOIN fact_harga fh ON d.SK = fh.SK_DATE
-        LEFT JOIN dim_rice_type drt ON fh.SK_RICE_TYPE = drt.SK
-        LEFT JOIN dim_market dm ON fh.SK_MARKET = dm.SK
-        WHERE dm.MARKET_NAME = 'Pasar Induk Beras Cipinang' ORDER BY d.SK;
-    """)
-    
-    try:
-        with _engine.connect() as conn:
-            df = pd.read_sql(query, conn)
-        
-        df["tanggal"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]].rename(columns={"YEAR": "year", "MONTH": "month", "DAY": "day"}), errors="coerce")
-        
-        # Aggregation Logic
-        df_main = df.groupby("tanggal").agg(
-        masuk=("masuk","sum"),
-        keluar=("keluar","sum"),
-        stok=("stok","mean")
-        ).reset_index()
-
-        df_main.fillna(0, inplace=True)
-        df_main["neraca"] = df_main["masuk"] - df_main["keluar"]
-        
-        df_stock = df_main[["tanggal", "stok"]].copy()
-        df_masuk = df.groupby(["tanggal"])['masuk'].sum().reset_index() # Placeholder structure
-        df_keluar = df.groupby(["tanggal"])['keluar'].sum().reset_index() # Placeholder structure
-        # ========= PATCH: Normalisasi kolom lokasi dari DB =========
-        # df_masuk
-        if 'lokasi' not in df_masuk.columns:
-            kemungkinan = [c for c in df_masuk.columns if c.lower() in ['lokasi','place','place_name','asal','lokasi_masuk']]
-            if kemungkinan:
-                df_masuk = df_masuk.rename(columns={kemungkinan[0]: 'lokasi'})
-            else:
-                df_masuk['lokasi'] = 'Unknown'
-
-        # df_keluar
-        if 'lokasi' not in df_keluar.columns:
-            kemungkinan = [c for c in df_keluar.columns if c.lower() in ['lokasi','place','place_name','asal','lokasi_keluar']]
-            if kemungkinan:
-                df_keluar = df_keluar.rename(columns={kemungkinan[0]: 'lokasi'})
-            else:
-                df_keluar['lokasi'] = 'Unknown'
-        # ========= END PATCH =========
-        df_price = df.pivot_table(index='tanggal', columns='nama_jenis', values='harga', aggfunc='mean')
-        
-        return df_main, df_stock, df_masuk, df_keluar, df_price
-    except Exception as e:
-        st.error(f"DB Error: {e}")
-        return None, None, None, None, None
-
-@st.cache_data(ttl=3600)
-def preprocess_data_from_excel(uploaded_file):
-    data = pd.read_excel(uploaded_file, sheet_name=None)
-    
-    # Helper to safely get and clean dataframe
-    def get_clean_sheet(name):
-        df = data.get(name)
-        if df is not None:
-            df = df.copy()
-            df.columns = [_clean_colname(c).strip() for c in df.columns]
-            # keep original case for value labels but provide lowercase helpers later
-        return df
-
-    def _find_date_col(df):
-        if df is None or df.columns.size == 0:
-            return None
-        for c in df.columns:
-            if str(c).lower() in ('tanggal','date','tgl','hari'):
-                return c
-        # dtype detection
-        for c in df.columns:
-            try:
-                if np.issubdtype(df[c].dtype, np.datetime64):
-                    return c
-            except Exception:
-                continue
-        return df.columns[0]
-
-    # read raw sheets
-    df_stock = get_clean_sheet('rice_stock')
-    df_delivery = get_clean_sheet('rice_delivery')
-    df_source = get_clean_sheet('rice_source')
-    df_price_raw = get_clean_sheet('rice_price')  # may be None
-
-    if df_stock is None:
-        return None, None, None, None, None
-
-    # --- PRICE processing (safe) ---
-    df_price = None
-    if df_price_raw is not None:
-        # normalize column names for price sheet (lower, no newlines)
-        df_price_raw = df_price_raw.copy()
-        df_price_raw.columns = [_clean_colname(c).lower() for c in df_price_raw.columns]
-        # detect date column
-        date_col = next((c for c in df_price_raw.columns if c in ('tanggal','date','tgl')), None)
-        if date_col is None and df_price_raw.shape[1] > 0:
-            date_col = df_price_raw.columns[0]
-        if date_col:
-            df_price_raw[date_col] = pd.to_datetime(df_price_raw[date_col], errors='coerce')
-            # pivot if there is a rice type column and price column names exist
-            # try common column names
-            name_col = next((c for c in df_price_raw.columns if 'jenis' in c or 'type' in c or 'nama' in c), None)
-            price_col = next((c for c in df_price_raw.columns if 'harga' in c or 'price' in c or 'value' in c), None)
-            if name_col and price_col:
-                df_price = df_price_raw.pivot_table(index=date_col, columns=name_col, values=price_col, aggfunc='mean')
-                df_price.index.name = 'tanggal'
-                df_price.index = pd.to_datetime(df_price.index, errors='coerce')
-            else:
-                # fallback: treat entire sheet as timeseries, ensure index is datetime
-                df_price_raw = df_price_raw.set_index(date_col).sort_index()
-                df_price_raw.index.name = 'tanggal'
-                df_price_raw.index = pd.to_datetime(df_price_raw.index, errors='coerce')
-                df_price = df_price_raw.copy()
-
-    # --- STOCK processing ---
-    df_stock = df_stock.copy()
-    # normalize stock date column
-    date_col_stock = _find_date_col(df_stock)
-    df_stock[date_col_stock] = pd.to_datetime(df_stock[date_col_stock], errors='coerce')
-    df_stock = df_stock.rename(columns={date_col_stock: 'tanggal'})
-    # ensure numeric columns exist (stok, masuk, keluar) create fallback columns
-    lower_cols = {c.lower(): c for c in df_stock.columns}
-    # map to standard names if present
-    if 'stok' not in lower_cols and any('stok' in c.lower() for c in df_stock.columns):
-        pass
-    # Ensure numeric
-    for want in ['stok', 'masuk', 'keluar']:
-        # try to find a column that contains the name (case-insensitive)
-        found = next((c for c in df_stock.columns if want in c.lower()), None)
-        if found:
-            df_stock[want] = pd.to_numeric(df_stock[found], errors='coerce').fillna(0)
-        elif want not in df_stock.columns:
-            df_stock[want] = 0
-
-    df_stock['tanggal'] = pd.to_datetime(df_stock['tanggal'], errors='coerce')
-    # Keep stok plus ensure tanggal datetime. We'll fill masuk/keluar later from source/delivery melts.
-    df_stock['tanggal'] = pd.to_datetime(df_stock['tanggal'], errors='coerce')
-    df_main = df_stock[['tanggal', 'stok']].copy()
-    # keep any existing stock-sheet masuk/keluar as fallback columns
-    if 'masuk' in df_stock.columns:
-        df_main['masuk_from_stock'] = pd.to_numeric(df_stock['masuk'], errors='coerce').fillna(0)
-    else:
-        df_main['masuk_from_stock'] = 0
-    if 'keluar' in df_stock.columns:
-        df_main['keluar_from_stock'] = pd.to_numeric(df_stock['keluar'], errors='coerce').fillna(0)
-    else:
-        df_main['keluar_from_stock'] = 0
-
-    # --- SOURCE (wide -> long) -----
-    if df_source is None:
-        df_masuk_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','masuk'])
-    else:
-        df_source = df_source.copy()
-        date_col_src = _find_date_col(df_source)
-        if date_col_src:
-            df_source[date_col_src] = pd.to_datetime(df_source[date_col_src], errors='coerce')
-            df_source = df_source.rename(columns={date_col_src: 'tanggal'})
-        else:
-            df_source['tanggal'] = pd.NaT
-
-        val_cols_src = [c for c in df_source.columns if c != 'tanggal']
-        if val_cols_src:
-            df_masuk_long = df_source.melt(id_vars='tanggal', value_vars=val_cols_src, var_name='lokasi', value_name='masuk')
-            df_masuk_long['lokasi'] = df_masuk_long['lokasi'].astype(str).str.strip()
-            df_masuk_long['lokasi_norm'] = df_masuk_long['lokasi'].str.lower().str.strip()
-            df_masuk_long['masuk'] = pd.to_numeric(df_masuk_long['masuk'], errors='coerce').fillna(0)
-            df_masuk_long = df_masuk_long[df_masuk_long['masuk'] > 0].reset_index(drop=True)
-        else:
-            df_masuk_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','masuk'])
-
-    # --- DELIVERY (wide -> long) -----
-    if df_delivery is None:
-        df_keluar_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','keluar'])
-    else:
-        df_delivery = df_delivery.copy()
-        date_col_del = _find_date_col(df_delivery)
-        if date_col_del:
-            df_delivery[date_col_del] = pd.to_datetime(df_delivery[date_col_del], errors='coerce')
-            df_delivery = df_delivery.rename(columns={date_col_del: 'tanggal'})
-        else:
-            df_delivery['tanggal'] = pd.NaT
-
-        val_cols_del = [c for c in df_delivery.columns if c != 'tanggal']
-        if val_cols_del:
-            df_keluar_long = df_delivery.melt(
-                id_vars='tanggal',
-                value_vars=val_cols_del,
-                var_name='lokasi',
-                value_name='keluar'
-            )
-            df_keluar_long['lokasi'] = df_keluar_long['lokasi'].astype(str).str.strip()
-            df_keluar_long['lokasi_norm'] = df_keluar_long['lokasi'].str.lower().str.strip()
-            df_keluar_long['keluar'] = pd.to_numeric(df_keluar_long['keluar'], errors='coerce').fillna(0)
-            df_keluar_long = df_keluar_long[df_keluar_long['keluar'] > 0]
-        else:
-            df_keluar_long = pd.DataFrame(columns=['tanggal','lokasi','lokasi_norm','keluar'])
-
-    # ----- AGGREGATE masuk/keluar per tanggal dan merge ke df_main -----
-    if not df_masuk_long.empty:
-        df_masuk_long['tanggal'] = pd.to_datetime(df_masuk_long['tanggal'], errors='coerce')
-        df_masuk_date = df_masuk_long.groupby('tanggal', as_index=False)['masuk'].sum()
-    else:
-        df_masuk_date = pd.DataFrame(columns=['tanggal','masuk'])
-
-    if not df_keluar_long.empty:
-        df_keluar_long['tanggal'] = pd.to_datetime(df_keluar_long['tanggal'], errors='coerce')
-        df_keluar_date = df_keluar_long.groupby('tanggal', as_index=False)['keluar'].sum()
-    else:
-        df_keluar_date = pd.DataFrame(columns=['tanggal','keluar'])
-
-    # merge aggregated flows to df_main; if no flows exist, fall back to stock-sheet columns
-    df_main = df_main.merge(df_masuk_date, on='tanggal', how='left')
-    df_main = df_main.merge(df_keluar_date, on='tanggal', how='left')
-    # fill with fallback values from stock sheet if df_masuk/keluar aggregates are missing
-    df_main['masuk'] = pd.to_numeric(df_main['masuk'].fillna(df_main.get('masuk_from_stock', 0)), errors='coerce').fillna(0)
-    df_main['keluar'] = pd.to_numeric(df_main['keluar'].fillna(df_main.get('keluar_from_stock', 0)), errors='coerce').fillna(0)
-    # compute neraca
-    df_main['neraca'] = df_main['masuk'] - df_main['keluar']
-
-    # Final safety: ensure tanggal datetime in long tables
-    if not df_masuk_long.empty:
-        df_masuk_long['tanggal'] = pd.to_datetime(df_masuk_long['tanggal'], errors='coerce')
-    if not df_keluar_long.empty:
-        df_keluar_long['tanggal'] = pd.to_datetime(df_keluar_long['tanggal'], errors='coerce')
- 
-    return df_main, df_stock, df_masuk_long, df_keluar_long, df_price
-# -------------------------
 # 3. Visualization Logic
 # -------------------------
 
 # --- Original Visualizations ---
 def create_time_series(df, y_col, title, color=None):
     if df is None or df.empty or y_col not in df.columns: return go.Figure()
-    return px.line(df, x='tanggal', y=y_col, title=title, template=DEFAULT_PLOTLY_TEMPLATE, line_shape='spline', color_discrete_sequence=[color] if color else None)
-
-def create_balance_chart(df):
-    if df is None or df.empty: return go.Figure()
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=df['tanggal'], y=df['masuk'], name='Masuk', marker_color='#2E86AB'))
-    fig.add_trace(go.Bar(x=df['tanggal'], y=-df['keluar'], name='Keluar', marker_color='#F24236'))
-    fig.add_trace(go.Scatter(x=df['tanggal'], y=df['neraca'], name='Neraca', line=dict(color='black', width=2, dash='dot')))
-    return fig.update_layout(title='Neraca Harian (Masuk vs Keluar)', barmode='relative', template=DEFAULT_PLOTLY_TEMPLATE)
-
-# --- NEW VISUALIZATIONS (From Notebook) ---
-
-# Feature: Heatmap Correlation
-def create_price_heatmap(df_price):
-    if df_price is None or df_price.empty:
-        return None
-    
-    corr = df_price.corr()
-    fig = px.imshow(corr,
-                    text_auto=True,
-                    aspect="auto",
-                    color_continuous_scale='RdYlGn',
-                    title="Heatmap Korelasi Harga Antar Jenis Beras")
-    # Force two-decimal formatting for the annotation text on the heatmap trace
-    try:
-        if fig.data and hasattr(fig.data[0], 'texttemplate'):
-            fig.data[0].texttemplate = "%{z:.2f}"
-    except Exception:
-        pass
-    return fig
-
-# Feature: Volatility Analysis
-def create_volatility_chart(df, target_col, window=7, title="Volatilitas"):
-    if df is None or df.empty or target_col not in df.columns:
-        return None
-    
-    df_vol = df.copy()
-    if 'tanggal' not in df_vol.columns and isinstance(df_vol.index, pd.DatetimeIndex):
-         df_vol = df_vol.reset_index()
-
-    # Calculate Rolling Std Dev
-    df_vol['volatility'] = df_vol[target_col].rolling(window=window).std()
-    
-    fig = px.line(df_vol, x='tanggal', y='volatility', 
-                  title=title, 
-                  labels={'volatility': f'Std Dev ({window} Hari)'},
-                  template='plotly_white')
-    fig.update_traces(line_color='#FF6F61')
-    return fig
-
-# Feature: Inventory Cover
-def create_inventory_cover_chart(df_main):
-    if df_main is None or df_main.empty: return None
-    
-    df_calc = df_main.copy().sort_values('tanggal')
-    # Rolling avg of outcome (7 days)
-    df_calc['avg_out_7d'] = df_calc['keluar'].rolling(window=7, min_periods=1).mean()
-    df_calc['avg_out_7d'] = df_calc['avg_out_7d'].replace(0, 1) # Avoid div by zero
-    
-    df_calc['cover_days'] = df_calc['stok'] / df_calc['avg_out_7d']
-    
-    fig = px.line(df_calc, x='tanggal', y='cover_days',
-                  title="Inventory Cover Days (Ketahanan Stok)",
-                  labels={'cover_days': 'Hari'},
-                  template='plotly_white')
-    fig.add_hline(y=20, line_dash="dot", annotation_text="Aman (20 hari)", annotation_position="bottom right")
-    return fig
-
-# Feature: Geospatial Maps
-def create_geo_map(df_flow, geo_lookup, flow_type='masuk'):
-    if df_flow is None or df_flow.empty: return None
-
-    # ===== FINAL PATCH GEO MAP: NORMALISASI DAN MERGE PADA lokasi_norm =====
-    geo_lookup = geo_lookup.copy()
-    geo_lookup['lokasi_norm'] = geo_lookup['lokasi'].astype(str).str.lower().str.strip()
-    # keep original lookup label
-    geo_lookup = geo_lookup.rename(columns={'lokasi': 'lokasi_lookup'})
-
-    df_flow = df_flow.copy()
-    # Ensure lokasi column exists (preprocess makes it)
-    if 'lokasi' not in df_flow.columns:
-        df_flow['lokasi'] = 'Unknown'
-    df_flow['lokasi_norm'] = df_flow['lokasi'].astype(str).str.lower().str.strip()
-
-    # Merge on normalized name
-    df_map = df_flow.merge(geo_lookup, on='lokasi_norm', how='inner')
-
-    if df_map.empty:
-        st.warning("Tidak ada lokasi yang cocok dengan geo lookup.")
-        return None
-    # ===== END PATCH =====
-
-    # Aggregate flow by lokasi_norm (sum) then attach lat/lon & readable lokasi label
-    df_agg = df_map.groupby('lokasi_norm')[flow_type].sum().reset_index()
-    df_agg = df_agg.merge(geo_lookup, on='lokasi_norm', how='left')
-    # use lokasi_lookup (nice display) if available, else use original lokasi
-    df_agg['lokasi_display'] = df_agg['lokasi_lookup'].fillna(df_agg['lokasi_norm'])
-
-    if df_agg.empty: return None
-
-    title = "Peta Asal Beras (Masuk)" if flow_type == 'masuk' else "Peta Distribusi Beras (Keluar)"
-    color_scale = "Greens" if flow_type == 'masuk' else "Reds"
-
-    fig = px.scatter_mapbox(
-        df_agg, lat="lat", lon="lon", size=flow_type, color=flow_type,
-        hover_name="lokasi_display", hover_data=[flow_type],
-        title=title,
-        color_continuous_scale=color_scale,
-        zoom=5, center={"lat": -6.8, "lon": 108},
-        mapbox_style="open-street-map"
-    )
-    fig.update_layout(margin={"r":0,"t":40,"l":0,"b":0})
-    return fig
-
-# Feature: Stock Distribution (KDE)
-def create_stock_distribution(df_stock):
-    if df_stock is None or df_stock.empty: return None
-    
-    x = df_stock['stok'].dropna()
-    hist_data = [x]
-    group_labels = ['Distribusi Stok']
-    
-    try:
-        fig = ff.create_distplot(hist_data, group_labels, show_hist=True, show_rug=False, curve_type='kde')
-        fig.update_layout(title="Distribusi Level Stok (Histogram & KDE)", template='plotly_white')
-        return fig
-    except Exception as e:
-        st.warning(f"Gagal membuat plot distribusi: {e}")
-        return None
-
-# Feature: Regression Stats
-def calculate_regression(df_stock, df_price, rice_type):
-    if df_stock is None or df_price is None: return None
-
-    # Normalize/prepare price dataframe
-    df_p = price_df_with_tanggal(df_price)
-    # Ensure df_p is valid and contains the rice_type column
-    if df_p is None or rice_type not in df_p.columns:
-        logger.warning(f"calculate_regression: price data missing or rice_type '{rice_type}' not found.")
-        return None
-
-    # Ensure df_stock has a 'tanggal' column (try resetting index if needed)
-    if 'tanggal' not in df_stock.columns:
-        df_stock = df_stock.reset_index()
-        # Rename first column to 'tanggal' if it isn't already
-        if df_stock.columns[0].lower() != 'tanggal':
-            df_stock = df_stock.rename(columns={df_stock.columns[0]: 'tanggal'})
-
-    # Ensure tanggal columns are datetime
-    df_stock['tanggal'] = pd.to_datetime(df_stock['tanggal'], errors='coerce')
-    df_p['tanggal'] = pd.to_datetime(df_p['tanggal'], errors='coerce')
-
-    # Merge safely
-    df_merge = pd.merge(df_stock, df_p[['tanggal', rice_type]], on='tanggal', how='inner')
-    df_merge.dropna(inplace=True)
-
-    if len(df_merge) < 2: return None
-
-    # Use the full returned object from linregress to safely access fields
-    lr = linregress(df_merge['stok'], df_merge[rice_type])
-    # Extract slope/intercept
-    slope = getattr(lr, 'slope', lr[0] if len(lr) > 0 else None)
-    intercept = getattr(lr, 'intercept', lr[1] if len(lr) > 1 else None)
-
-    # Extract r-value robustly (handles namedtuple, tuple, or array-like)
-    # Use getattr to avoid direct attribute access issues in static analysis/stubs
-    r_val = getattr(lr, 'rvalue', None)
-    if r_val is None:
-        try:
-            r_val = lr[2]
-        except Exception:
-            r_val = None
-
-    # Safely convert to float and compute R-squared (more robust handling)
-    r2_val = None
-    if r_val is None:
-        r2_val = None
-    else:
-        r_float = None
-        # Try numpy conversion first
-        try:
-            arr = np.asarray(r_val)
-            # If arr is scalar-like, get item; if it's an array, try to extract a floatable element
-            if arr.size == 1:
-                r_float = float(arr.item())
-            else:
-                # pick first element and try to convert
-                r_float = float(arr.flat[0])
-        except Exception:
-            # Fallback: handle common iterable types
-            try:
-                if isinstance(r_val, (list, tuple)):
-                    r_float = float(r_val[0])
-                else:
-                    r_float = float(r_val) # type: ignore
-            except Exception:
-                r_float = None
-
-        if r_float is not None:
-            try:
-                r2_val = r_float ** 2
-            except Exception:
-                r2_val = None
-        else:
-            r2_val = None
-
-    p_value = getattr(lr, 'pvalue', lr[3] if len(lr) > 3 else None)
-
-    return {
-        'slope': slope,
-        'intercept': intercept,
-        'r2': r2_val,
-        'p_value': p_value,
-        'df': df_merge
-    }
+    # This function is now imported from lib.plots, but the definition was here.
+    # We keep the call but remove the local definition.
+    return px.line(df, x=COL_TANGGAL, y=y_col, title=title, template=DEFAULT_PLOTLY_TEMPLATE, line_shape='spline', color_discrete_sequence=[color] if color else None)
 
 # -------------------------
 # 4. UI Rendering
@@ -631,9 +134,9 @@ def render_sidebar():
                     if df_main is not None:
                         st.session_state.data_loaded = True
                         st.session_state.app_data = {
-                            'df': df_main, 'df_stock': df_stock, 
-                            'df_masuk': df_masuk, 'df_keluar': df_keluar, 
-                            'df_price': df_price
+                            'df': df_main, COL_STOK: df_stock, 
+                            COL_MASUK: df_masuk, COL_KELUAR: df_keluar, 
+                            'df_price': df_price # df_price is special
                         }
                         st.rerun()
         else:
@@ -660,8 +163,8 @@ def render_sidebar():
                             if df_main is not None:
                                 st.session_state.data_loaded = True
                                 st.session_state.app_data = {
-                                    'df': df_main, 'df_stock': df_stock,
-                                    'df_masuk': df_masuk, 'df_keluar': df_keluar,
+                                    'df': df_main, COL_STOK: df_stock,
+                                    COL_MASUK: df_masuk, COL_KELUAR: df_keluar,
                                     'df_price': df_price
                                 }
                                 st.success("Connected & data loaded from DB.")
@@ -676,8 +179,9 @@ def render_sidebar():
             database = st.text_input("Database", value=secret_defaults.get("database", ""))
 
             if st.button("Connect (Manual)"):
-                if not all([host, port, user, password, database]):
-                    st.error("Lengkapi semua field koneksi terlebih dahulu.")
+                # Password is optional, so it's not included in the validation check.
+                if not all([host, port, user, database]):
+                    st.error("Harap isi field Host, Port, User, dan Database.")
                 else:
                     conn_str = f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{database}"
                     try:
@@ -694,14 +198,18 @@ def render_sidebar():
                                 if df_main is not None:
                                     st.session_state.data_loaded = True
                                     st.session_state.app_data = {
-                                        'df': df_main, 'df_stock': df_stock,
-                                        'df_masuk': df_masuk, 'df_keluar': df_keluar,
+                                        'df': df_main, COL_STOK: df_stock,
+                                        COL_MASUK: df_masuk, COL_KELUAR: df_keluar,
                                         'df_price': df_price
                                     }
                                     st.success("Connected & data loaded from DB (manual).")
                                     st.rerun()
                     except Exception as e:
-                        st.error(f"Koneksi gagal: {e}")
+                        # Sanitize error message to user
+                        logger.error(f"Manual DB connection failed: {e}", exc_info=True)
+                        st.error("Koneksi Gagal. Periksa kembali detail koneksi Anda. Pastikan host, port, user, dan password benar.")
+                        st.expander("Detail Error Teknis").exception(e)
+
 
 def render_metrics(df_filtered):
     if df_filtered is None or df_filtered.empty: return
@@ -709,24 +217,24 @@ def render_metrics(df_filtered):
     col1, col2, col3, col4 = st.columns(4)
     
     # Tambahkan parameter 'help' untuk tooltip
-    col1.metric("Rata-rata Stok", f"{df_filtered['stok'].mean():,.0f} Ton", 
+    col1.metric("Rata-rata Stok", f"{df_filtered[COL_STOK].mean():,.0f} Ton", 
                 help="Rata-rata stok harian yang tersedia di gudang dalam periode waktu yang dipilih.")
                 
-    col2.metric("Total Masuk", f"{df_filtered['masuk'].sum():,.0f} Ton", 
+    col2.metric("Total Masuk", f"{df_filtered[COL_MASUK].sum():,.0f} Ton", 
                 help="Total akumulasi volume beras yang masuk ke pasar.")
                 
-    col3.metric("Total Keluar", f"{df_filtered['keluar'].sum():,.0f} Ton", 
+    col3.metric("Total Keluar", f"{df_filtered[COL_KELUAR].sum():,.0f} Ton", 
                 help="Total akumulasi volume beras yang didistribusikan keluar pasar.")
                 
-    col4.metric("Net Neraca", f"{df_filtered['neraca'].sum():,.0f} Ton", 
+    col4.metric("Net Neraca", f"{df_filtered[COL_NERACA].sum():,.0f} Ton", 
                 help="Selisih antara Total Masuk dikurangi Total Keluar. Positif = Surplus, Negatif = Defisit.")
 
 def render_main_ui():
     app_data = st.session_state.app_data
     df = app_data['df']
-    df_price = app_data['df_price']
-    df_masuk = app_data['df_masuk']
-    df_keluar = app_data['df_keluar']
+    df_price = app_data.get('df_price') # Use .get() for safety
+    df_masuk = app_data[COL_MASUK]
+    df_keluar = app_data[COL_KELUAR]
 
     # --- Sidebar Filters ---
     with st.sidebar:
@@ -734,26 +242,55 @@ def render_main_ui():
         st.subheader("Filter Dashboard")
         min_ts = pd.to_datetime(df['tanggal'].min(), errors='coerce')
         max_ts = pd.to_datetime(df['tanggal'].max(), errors='coerce')
-        min_date, max_date = min_ts.date(), max_ts.date()
-        start_date = st.date_input("Mulai", min_date)
+        min_date, max_date = (min_ts.date() if pd.notna(min_ts) else None, max_ts.date() if pd.notna(max_ts) else None)
+        start_date = st.date_input("Mulai", min_date) # Let Streamlit handle None
         end_date = st.date_input("Sampai", max_date)
         
         rice_opts = list(df_price.columns) if df_price is not None else []
         selected_rice = st.selectbox("Jenis Beras (untuk Harga)", rice_opts) if rice_opts else None
 
+        st.divider()
+        granularity = st.radio("Tingkat Agregasi Data", ["Harian", "Bulanan", "Tahunan"], key="granularity_selector")
+        
+        if granularity != "Harian":
+            st.caption(f"💡 Filter tanggal akan diterapkan pada level {granularity.lower()}.")
+
+    is_daily_view = (granularity == "Harian")
+
     # --- Filtering ---
     mask = (df['tanggal'].dt.date >= start_date) & (df['tanggal'].dt.date <= end_date)
     df_filt = df[mask]
     
-    df_masuk_filt = df_masuk[(df_masuk['tanggal'].dt.date >= start_date) & (df_masuk['tanggal'].dt.date <= end_date)] if df_masuk is not None and not df_masuk.empty else pd.DataFrame()
-    df_keluar_filt = df_keluar[(df_keluar['tanggal'].dt.date >= start_date) & (df_keluar['tanggal'].dt.date <= end_date)] if df_keluar is not None and not df_keluar.empty else pd.DataFrame()
+    df_masuk_filt = df_masuk[(df_masuk[COL_TANGGAL].dt.date >= start_date) & (df_masuk[COL_TANGGAL].dt.date <= end_date)] if df_masuk is not None and not df_masuk.empty else pd.DataFrame()
+    df_keluar_filt = df_keluar[(df_keluar[COL_TANGGAL].dt.date >= start_date) & (df_keluar[COL_TANGGAL].dt.date <= end_date)] if df_keluar is not None and not df_keluar.empty else pd.DataFrame()
     
     df_price_filt = None
     if df_price is not None:
         df_price_filt = df_price[(df_price.index.date >= start_date) & (df_price.index.date <= end_date)]
 
+    # --- Aggregation Logic based on Granularity ---
+    if is_daily_view:
+        df_agg = df_filt.copy()
+    else:
+        # Set tanggal as index for resampling
+        df_to_resample = df_filt.set_index('tanggal')
+        
+        resample_rule = 'M' if granularity == "Bulanan" else 'Y'
+        
+        # Define aggregation rules
+        agg_rules = {
+            COL_STOK: 'mean',
+            COL_MASUK: 'sum',
+            COL_KELUAR: 'sum',
+            COL_NERACA: 'sum'
+        }
+        
+        df_agg = df_to_resample.resample(resample_rule).agg(agg_rules).reset_index()
+        # Rename the resampled date column back to 'tanggal'
+        df_agg = df_agg.rename(columns={'index': 'tanggal'})
+
     # --- UI Layout ---
-    render_metrics(df_filt)
+    render_metrics(df_agg)
 
     # Tabs Definition (Added new tabs for Notebook features)
     tabs = st.tabs([
@@ -780,31 +317,26 @@ def render_main_ui():
         
         col_a, col_b = st.columns(2)
         with col_a:
-            st.plotly_chart(create_time_series(df_filt, 'stok', "Tren Stok Harian", "green"), use_container_width=True)
+            st.plotly_chart(create_time_series(df_agg, COL_STOK, f"Tren Stok {granularity}", "green"), use_container_width=True, key="main_stok_ts")
         with col_b:
-            st.plotly_chart(create_balance_chart(df_filt), use_container_width=True)
+            st.plotly_chart(create_balance_chart(df_agg), use_container_width=True, key="main_balance_chart")
 
         st.divider()
 
-        # Penjelasan Tren Harga
         if selected_rice and df_price_filt is not None:
-            with st.expander("ℹ️ Panduan Membaca Dashboard Utama (Klik untuk buka)", expanded=True):
-                st.markdown("""
-                * **Tren Stok Harian (Kiri):** Garis ini menunjukkan riwayat ketersediaan beras di gudang. 
-                    * *Naik* = Penumpukan stok. *Turun* = Stok menipis (permintaan tinggi/pasokan kurang).
-                * **Neraca Harian (Kanan):** Membandingkan arus barang.
-                    * **Batang Biru (Masuk):** Supply dari daerah.
-                    * **Batang Merah (Keluar):** Distribusi ke pasar.
-                    * **Titik Hitam (Net):** Surplus (di atas 0) atau Defisit (di bawah 0).
-                """)
-
             # Preprocess price data for plotting
             p_plot = df_price_filt[[selected_rice]].reset_index()
-            p_plot.columns = ['tanggal', selected_rice]
-            st.plotly_chart(create_time_series(p_plot, selected_rice, f"Tren Harga: {selected_rice}", "blue"), use_container_width=True)
+            p_plot.columns = [COL_TANGGAL, selected_rice]
+            st.plotly_chart(create_time_series(p_plot, selected_rice, f"Tren Harga: {selected_rice}", "blue"), use_container_width=True, key="main_price_ts")
 
     # --- TAB 2: Peta Geografis (Feature from Notebook) ---
     with tabs[1]:
+        if not is_daily_view:
+            st.info(
+                "ℹ️ **Catatan:** Tampilan Peta Geografis selalu menggunakan data **Harian** untuk menunjukkan "
+                "detail lokasi asal/tujuan, terlepas dari pilihan agregasi di sidebar."
+            )
+
         st.subheader("Analisis Distribusi Geospasial")
         
         # Panduan membaca peta
@@ -822,81 +354,87 @@ def render_main_ui():
         c1, c2 = st.columns(2)
         with c1:
             st.write("**Peta Asal Barang (Masuk)**")
-            fig_map_in = create_geo_map(df_masuk_filt, geo_lookup, 'masuk')
-            if fig_map_in: st.plotly_chart(fig_map_in, use_container_width=True)
+            fig_map_in = create_geo_map(df_masuk_filt, geo_lookup, COL_MASUK)
+            if fig_map_in: st.plotly_chart(fig_map_in, use_container_width=True, key="geo_map_in")
             else: st.info("Data lokasi masuk tidak tersedia.")
             
         with c2:
             st.write("**Peta Tujuan Barang (Keluar)**")
-            fig_map_out = create_geo_map(df_keluar_filt, geo_lookup, 'keluar')
-            if fig_map_out: st.plotly_chart(fig_map_out, use_container_width=True)
+            fig_map_out = create_geo_map(df_keluar_filt, geo_lookup, COL_KELUAR)
+            if fig_map_out: st.plotly_chart(fig_map_out, use_container_width=True, key="geo_map_out")
             else: st.info("Data lokasi keluar tidak tersedia.")
             
         with st.expander("Lihat Data Tabel Distribusi"):
             if not df_masuk_filt.empty:
                 st.write("Top Supply (Masuk):")
-                st.dataframe(df_masuk_filt.groupby('lokasi')['masuk'].sum().sort_values(ascending=False).head())
+                st.dataframe(df_masuk_filt.groupby(COL_LOKASI)[COL_MASUK].sum().sort_values(ascending=False).head())
 
     # --- TAB 3: Analisis Lanjutan (Volatility & Inventory Cover) ---
     with tabs[2]:
         st.subheader("Analisis Kestabilan & Efisiensi")
         
-        # 1. Inventory Cover
-        st.markdown("##### 1. Inventory Cover Days")
-        
-        # Expander untuk penjelasan rumus
-        with st.expander("📖 Cara Membaca Inventory Cover (Klik disini)"):
-            st.markdown("""
-            **Definisi:** Estimasi berapa hari stok saat ini akan bertahan jika tidak ada pasokan baru.
+        if is_daily_view:
+            # 1. Inventory Cover
+            st.markdown("##### 1. Inventory Cover Days")
+
+            # Expander untuk penjelasan rumus
+            with st.expander("📖 Cara Membaca Inventory Cover (Klik disini)"):
+                st.markdown("""
+                **Definisi:** Estimasi berapa hari stok saat ini akan bertahan jika tidak ada pasokan baru.
+                
+                $$
+                \\text{Cover Days} = \\frac{\\text{Stok Hari Ini}}{\\text{Rata-rata Keluar (7 hari terakhir)}}
+                $$
+                
+                **Panduan Indikator:**
+                * 🟢 **> 20 Hari:** Stok Aman.
+                * 🟡 **10 - 20 Hari:** Waspada.
+                * 🔴 **< 10 Hari:** Kritis (Risiko kelangkaan tinggi).
+                """)
+
+            st.caption("Berapa hari stok saat ini mampu menutupi rata-rata permintaan keluar (Rolling 7 hari)?")
+            fig_cover = create_inventory_cover_chart(df_agg, days_cover=20) # Match original logic
+            if fig_cover: st.plotly_chart(fig_cover, use_container_width=True, key="inventory_cover_chart")
             
-            $$
-            \\text{Cover Days} = \\frac{\\text{Stok Hari Ini}}{\\text{Rata-rata Keluar (7 hari terakhir)}}
-            $$
-            
-            **Panduan Indikator:**
-            * 🟢 **> 20 Hari:** Stok Aman.
-            * 🟡 **10 - 20 Hari:** Waspada.
-            * 🔴 **< 10 Hari:** Kritis (Risiko kelangkaan tinggi).
+            # 2. Volatility
+            st.markdown("##### 2. Volatilitas Stok & Harga")
+            st.info("""
+            **Apa itu Volatilitas?**
+            Ini mengukur "kepanikan" pasar. Grafik yang **tinggi** menunjukkan harga/stok berubah-ubah secara drastis (tidak stabil) dalam waktu singkat.
+            Grafik yang **rendah/datar** menunjukkan kondisi pasar yang tenang dan stabil.
             """)
 
-        st.caption("Berapa hari stok saat ini mampu menutupi rata-rata permintaan keluar (Rolling 7 hari)?")
-        fig_cover = create_inventory_cover_chart(df_filt)
-        if fig_cover: st.plotly_chart(fig_cover, use_container_width=True)
-        
-        # 2. Volatility
-        st.markdown("##### 2. Volatilitas Stok & Harga")
-        st.info("""
-        **Apa itu Volatilitas?**
-        Ini mengukur "kepanikan" pasar. Grafik yang **tinggi** menunjukkan harga/stok berubah-ubah secara drastis (tidak stabil) dalam waktu singkat.
-        Grafik yang **rendah/datar** menunjukkan kondisi pasar yang tenang dan stabil.
-        """)
-
-        c_vol1, c_vol2 = st.columns(2)
-        with c_vol1:
-            fig_v_stok = create_volatility_chart(df_filt, 'stok', window=30, title="Volatilitas Stok (30 Hari)")
-            if fig_v_stok: st.plotly_chart(fig_v_stok, use_container_width=True)
-            
-        with c_vol2:
-            if df_price_filt is not None and selected_rice:
-                p_reset = df_price_filt[[selected_rice]].reset_index().rename(columns={df_price_filt.index.name: 'tanggal'})
-                fig_v_price = create_volatility_chart(p_reset, selected_rice, window=7, title=f"Volatilitas Harga {selected_rice} (7 Hari)")
-                if fig_v_price: st.plotly_chart(fig_v_price, use_container_width=True)
+            c_vol1, c_vol2 = st.columns(2)
+            with c_vol1:
+                fig_v_stok = create_volatility_chart(df_agg[[COL_TANGGAL, COL_STOK]], target_col=COL_STOK, window=30, title="Volatilitas Stok (30 Hari)")
+                if fig_v_stok: st.plotly_chart(fig_v_stok, use_container_width=True, key="volatility_stok_chart")
+                
+            with c_vol2:
+                if df_price_filt is not None and selected_rice:
+                    p_reset = df_price_filt[[selected_rice]].reset_index().rename(columns={df_price_filt.index.name: COL_TANGGAL})
+                    fig_v_price = create_volatility_chart(p_reset, target_col=selected_rice, title=f"Volatilitas Harga {selected_rice} (7 Hari)", window=7)
+                    if fig_v_price: st.plotly_chart(fig_v_price, use_container_width=True, key="volatility_price_chart")
+        else:
+            st.warning(
+                f"Analisis **Inventory Cover** dan **Volatility** tidak tersedia untuk tampilan **{granularity}** "
+                "karena metrik ini dirancang untuk analisis harian."
+            )
 
         st.divider()
 
-    # 3. Heatmap
-    st.markdown("### 3. Korelasi Antar Jenis Beras")
-    with st.expander("📖 Cara Membaca Heatmap (Matriks Warna)"):
-            st.markdown("""
-            Matriks ini menunjukkan hubungan pergerakan harga antar jenis beras:
-            * **Warna Hijau Tua (Mendekati 1.0):** Hubungan Kuat & Searah. Jika Beras A naik, Beras B **pasti ikut naik**. (Contoh: IR-64 I dan IR-64 II).
-            * **Warna Merah (Mendekati -1.0):** Hubungan Terbalik. Jika Beras A naik, Beras B justru turun.
-            * **Warna Pucat (Mendekati 0):** Tidak ada hubungan. Pergerakan harga mereka tidak saling mempengaruhi.
-            """)
-        
-    if df_price_filt is not None:
-            fig_corr = create_price_heatmap(df_price_filt)
-            if fig_corr: st.plotly_chart(fig_corr, use_container_width=True)
+        # 3. Heatmap
+        st.markdown("### 3. Korelasi Antar Jenis Beras")
+        with st.expander("📖 Cara Membaca Heatmap (Matriks Warna)"):
+                st.markdown("""
+                Matriks ini menunjukkan hubungan pergerakan harga antar jenis beras:
+                * **Warna Hijau Tua (Mendekati 1.0):** Hubungan Kuat & Searah. Jika Beras A naik, Beras B **pasti ikut naik**. (Contoh: IR-64 I dan IR-64 II).
+                * **Warna Merah (Mendekati -1.0):** Hubungan Terbalik. Jika Beras A naik, Beras B justru turun.
+                * **Warna Pucat (Mendekati 0):** Tidak ada hubungan. Pergerakan harga mereka tidak saling mempengaruhi.
+                """)
+            
+        if df_price_filt is not None:
+                fig_corr = create_price_heatmap(df_price_filt, correlation=True) # Use correlation heatmap
+                if fig_corr: st.plotly_chart(fig_corr, use_container_width=True, key="price_correlation_heatmap")
 
     # --- TAB 4: Statistik & Regresi (Regression Stats & Distribution) ---
     with tabs[3]:
@@ -913,17 +451,17 @@ def render_main_ui():
             * **Lebar Gunung:** Menunjukkan variasi stok. Semakin lebar, semakin tidak pasti ketersediaan stok di gudang.
             """)
 
-            fig_dist = create_stock_distribution(df_filt)
-            if fig_dist: st.plotly_chart(fig_dist, use_container_width=True)
+            fig_dist = create_stock_distribution(df_agg)
+            if fig_dist: st.plotly_chart(fig_dist, use_container_width=True, key="stock_distribution_chart")
             
             st.write("Statistik Deskriptif Stok:")
-            desc = df_filt['stok'].describe()
+            desc = df_agg[COL_STOK].describe()
             st.dataframe(desc)
 
         with col_stat2:
             st.markdown(f"#### Regresi: Stok vs Harga ({selected_rice})")
             if selected_rice:
-                reg_res = calculate_regression(df_filt, df_price, selected_rice)
+                reg_res = calculate_regression(df_agg, df_price, selected_rice)
                 if reg_res:
                     # Penjelasan interpretasi hasil
                     st.info(f"💡 **Interpretasi:** Setiap stok bertambah **1 Ton**, harga diprediksi berubah sebesar **Rp {reg_res['slope']:.2f}**.")
@@ -946,8 +484,13 @@ def render_main_ui():
                         st.warning("Hubungan Tidak Signifikan")
                         
                     # Scatter Plot
-                    fig_reg = px.scatter(reg_res['df'], x='stok', y=selected_rice, trendline='ols', title="Scatter Plot Regresi")
-                    st.plotly_chart(fig_reg, use_container_width=True)
+                    fig_reg = px.scatter(
+                        reg_res['df'], x=COL_STOK, y=selected_rice, 
+                        trendline='ols', 
+                        title="Scatter Plot Regresi",
+                        template=DEFAULT_PLOTLY_TEMPLATE
+                    )
+                    st.plotly_chart(fig_reg, use_container_width=True, key="regression_scatter_plot")
 
                     st.markdown("---")
                     csv_reg = convert_df_to_csv(reg_res['df'])
@@ -973,11 +516,13 @@ def render_main_ui():
         * Pilih **Holt-Winters** jika pola data Anda berulang secara mingguan/bulanan yang sangat teratur.
         """)
 
-        if len(df_filt) > 10:
+        if len(df_agg) > 10:
             method = st.radio("Metode", ["Prophet", "Holt-Winters"], horizontal=True)
-            days = st.slider("Horizon Hari", 7, 90, 30)
             
-            df_fc = df_filt[['tanggal', 'stok']].rename(columns={'tanggal':'ds', 'stok':'y'})
+            horizon_label = f"Horizon Peramalan ({granularity.replace('an', '')})"
+            days = st.slider(horizon_label, 7, 90, 30)
+
+            df_fc = df_agg[[COL_TANGGAL, COL_STOK]].rename(columns={COL_TANGGAL:FC_COL_DS, COL_STOK:FC_COL_Y})
 
             if len(df_fc) < 14:
                 st.error("Data terlalu sedikit untuk forecasting.")
@@ -990,13 +535,13 @@ def render_main_ui():
                 forecast = m.predict(future)
                 
                 fig_fc = go.Figure()
-                fig_fc.add_trace(go.Scatter(x=df_fc['ds'], y=df_fc['y'], name='Historis'))
-                fig_fc.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], name='Forecast'))
-                fig_fc.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_upper'], fill=None, mode='lines', line_color='lightgrey', showlegend=False))
-                fig_fc.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_lower'], fill='tonexty', mode='lines', line_color='lightgrey', name='Confidence Interval'))
-                st.plotly_chart(fig_fc, use_container_width=True)
+                fig_fc.add_trace(go.Scatter(x=df_fc[FC_COL_DS], y=df_fc[FC_COL_Y], name='Historis'))
+                fig_fc.add_trace(go.Scatter(x=forecast[FC_COL_DS], y=forecast['yhat'], name='Forecast'))
+                fig_fc.add_trace(go.Scatter(x=forecast[FC_COL_DS], y=forecast['yhat_upper'], fill=None, mode='lines', line_color='lightgrey', showlegend=False))
+                fig_fc.add_trace(go.Scatter(x=forecast[FC_COL_DS], y=forecast['yhat_lower'], fill='tonexty', mode='lines', line_color='lightgrey', name='Confidence Interval'))
+                st.plotly_chart(fig_fc, use_container_width=True, key="prophet_forecast_chart")
 
-                output_prophet = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].rename(
+                output_prophet = forecast[[FC_COL_DS, 'yhat', 'yhat_lower', 'yhat_upper']].rename(
                     columns={'ds':'tanggal', 'yhat':'prediksi', 'yhat_lower': 'Batas Bawah', 'yhat_upper': 'Batas Atas'}    
                 )
                 csv_fc = convert_df_to_csv(output_prophet)
@@ -1011,25 +556,27 @@ def render_main_ui():
 
             else: # Holt Winters
                 try:
-                    season = min(7, max(2, len(df_fc)//2))
-                    model = ExponentialSmoothing(df_fc['y'], seasonal='add', seasonal_periods=season).fit()
+                    # Ensure there's enough data for the seasonal period
+                    season = 7 if len(df_fc) >= 14 else (len(df_fc) // 2 if len(df_fc) > 2 else None)
+                    model = ExponentialSmoothing(df_fc[FC_COL_Y], seasonal='add' if season else None, seasonal_periods=season).fit()
                     pred = model.forecast(days)
                     
                     # Create date range for forecast
-                    last_date = df_fc['ds'].iloc[-1]
+                    last_date = df_fc[FC_COL_DS].iloc[-1]
                     date_range = pd.date_range(last_date, periods=days+1)[1:]
                     
                     fig_hw = go.Figure()
-                    fig_hw.add_trace(go.Scatter(x=df_fc['ds'], y=df_fc['y'], name='Historis'))
+                    fig_hw.add_trace(go.Scatter(x=df_fc[FC_COL_DS], y=df_fc[FC_COL_Y], name='Historis'))
                     fig_hw.add_trace(go.Scatter(x=date_range, y=pred, name='Forecast (HW)'))
-                    st.plotly_chart(fig_hw, use_container_width=True)
+                    st.plotly_chart(fig_hw, use_container_width=True, key="holtwinters_forecast_chart")
                 except Exception as e:
-                    st.error(f"Error Holt-Winters: {e}")
+                    logger.error(f"Holt-Winters failed: {e}", exc_info=True)
+                    st.error(f"Gagal menjalankan peramalan Holt-Winters. Coba metode Prophet atau periksa data Anda.")
         else:
             st.warning("Data terlalu sedikit untuk peramalan.")
 
-# --- Main Entry Point ---
 def main():
+    """Main entry point to run the Streamlit application."""
     if 'data_loaded' not in st.session_state:
         st.session_state.data_loaded = False
         st.session_state.app_data = {}
@@ -1037,13 +584,9 @@ def main():
     if not st.session_state.data_loaded:
         render_sidebar()
         st.info("👈 Silakan Upload Excel atau Koneksi Database di Sidebar.")
-        
-        # Optional: Landing Page Dummy Data visualization logic could go here
         st.markdown("<div class='title'>Selamat Datang di Dashboard Analisis Beras</div>", unsafe_allow_html=True)
     else:
         render_main_ui()
 
-from app.ui import run_app
-
 if __name__ == "__main__":
-    run_app()
+    main()

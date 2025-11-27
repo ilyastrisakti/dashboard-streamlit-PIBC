@@ -194,12 +194,12 @@ def _render_filters(app_data):
         if st.sidebar.button("Reset filters"):
             st.session_state.filters = {"date_range": None, "lokasi": None, "rice_type": None}
         if st.sidebar.button("Reload data (clear cache)"):
-            # Try the public experimental API first; if it's not available in the
+            # Try the public API first; if it's not available in the
             # runtime (some environments/type-checkers), fall back to raising the
             # internal RerunException so Streamlit restarts the script. If neither
             # approach works, clear relevant session state and prompt the user to refresh.
             try:
-                st.experimental_rerun()
+                st.rerun()
             except Exception:
                 try:
                     from streamlit.runtime.scriptrunner import RerunException
