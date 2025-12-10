@@ -8,6 +8,7 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 from .constants import *
+from .constants import FC_COL_DS, FC_COL_Y
 
 # Choose plotly template based on Streamlit theme (fallback)
 try:
@@ -279,4 +280,62 @@ def create_geo_map(df_flow: pd.DataFrame, geo_lookup: pd.DataFrame, flow_type: s
         showlegend=False
     )
 
+    return fig
+
+# Tambahkan import constants di bagian atas jika belum lengkap
+from .constants import FC_COL_DS, FC_COL_Y
+
+def create_forecast_chart(df_hist: pd.DataFrame, df_pred: pd.DataFrame, method: str = "Prophet", template: Optional[str] = None) -> go.Figure:
+    """
+    Membuat grafik peramalan gabungan antara data historis dan prediksi.
+    Mendukung visualisasi area confidence interval jika metode adalah Prophet.
+    """
+    fig = go.Figure()
+    
+    # Plot Data Historis
+    fig.add_trace(go.Scatter(
+        x=df_hist[FC_COL_DS], 
+        y=df_hist[FC_COL_Y], 
+        name='Historis',
+        line=dict(color='#2E86AB')
+    ))
+    
+    # Plot Data Prediksi
+    # Pastikan nama kolom prediksi konsisten ('yhat')
+    if 'yhat' in df_pred.columns:
+        fig.add_trace(go.Scatter(
+            x=df_pred[FC_COL_DS], 
+            y=df_pred['yhat'], 
+            name=f'Forecast ({method})',
+            line=dict(color='#F24236', dash='dash')
+        ))
+    
+    # Khusus Prophet: Plot Confidence Interval (yhat_upper & yhat_lower)
+    if method == "Prophet" and 'yhat_upper' in df_pred.columns and 'yhat_lower' in df_pred.columns:
+        fig.add_trace(go.Scatter(
+            x=df_pred[FC_COL_DS], 
+            y=df_pred['yhat_upper'], 
+            fill=None, 
+            mode='lines', 
+            line_color='lightgrey', 
+            showlegend=False
+        ))
+        fig.add_trace(go.Scatter(
+            x=df_pred[FC_COL_DS], 
+            y=df_pred['yhat_lower'], 
+            fill='tonexty', 
+            mode='lines', 
+            line_color='lightgrey', 
+            name='Confidence Interval'
+        ))
+        
+    fig.update_layout(
+        title=f"Peramalan Stok Menggunakan Metode {method}",
+        xaxis_title="Tanggal",
+        yaxis_title="Stok (Ton)",
+        margin={"r":0,"t":40,"l":0,"b":0},
+        template=template or DEFAULT_PLOTLY_TEMPLATE,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
     return fig

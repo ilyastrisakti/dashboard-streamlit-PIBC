@@ -7,19 +7,17 @@ PIBC Explorer final
 import logging
 import warnings
 from typing import Optional, Tuple
-
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.figure_factory as ff # Added for KDE Distribution
 import streamlit as st
-from prophet import Prophet
-from sqlalchemy import create_engine, text
-from st_aggrid import AgGrid, GridOptionsBuilder
+from lib.forecast import run_prophet_forecast, run_holtwinters_forecast
+from lib.plots import create_forecast_chart
+from sqlalchemy import create_engine
 from streamlit_option_menu import option_menu
 from streamlit_plotly_events import plotly_events
-
 from lib.constants import *
 from lib.utils import price_df_with_tanggal, convert_df_to_csv, calculate_regression
 from lib.data import (
@@ -52,7 +50,6 @@ st.set_page_config(
 )
 
 warnings.filterwarnings("ignore")
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -113,7 +110,7 @@ def render_sidebar():
         st.title("🌾 PIBC Explorer")
         
         if st.session_state.get('data_loaded'):
-            if st.button("🔄 Reset Data"):
+            if st.button("🔄 Reset Data / Koneksi Baru"):
                 st.session_state.data_loaded = False
                 st.session_state.app_data = {}
                 st.rerun()
@@ -139,6 +136,13 @@ def render_sidebar():
                         st.rerun()
         else:
             st.markdown("## Koneksi Database")
+
+            st.caption("Filter data di awal (Server-side) untuk performa lebih cepat:")
+            col_d1, col_d2 = st.columns(2)
+            # Default: None (Load All) atau set default (1 tahun terakhir)
+            db_start_date = col_d1.date_input("Dari", value=None)
+            db_end_date = col_d2.date_input("Sampai", value=None)
+
             st.caption("Gunakan st.secrets jika tersedia, atau isi form manual di bawah.")
 
             # Try using st.secrets first (button)
@@ -177,37 +181,24 @@ def render_sidebar():
             database = st.text_input("Database", value=secret_defaults.get("database", ""))
 
             if st.button("Connect (Manual)"):
-                # Password is optional, so it's not included in the validation check.
-                if not all([host, port, user, database]):
-                    st.error("Harap isi field Host, Port, User, dan Database.")
-                else:
+                if all([host, port, user, database]):
                     conn_str = f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{database}"
                     try:
                         eng_manual = create_engine(conn_str)
-                        # quick test query
-                        with eng_manual.connect() as conn:
-                            conn.execute(text("SELECT 1"))
-                        with st.spinner("Mengambil data dari database..."):
-                            result = load_data_from_db(eng_manual)
-                            if result is None:
-                                st.error("Gagal memuat data dari database. Cek query atau hak akses.")
-                            else:
+                        with st.spinner("Mengambil data..."):
+                            # PANGGIL DENGAN FILTER TANGGAL
+                            result = load_data_from_db(eng_manual, start_date=db_start_date, end_date=db_end_date)
+                            if result and result[0] is not None:
                                 df_main, df_stock, df_masuk, df_keluar, df_price = result
-                                if df_main is not None:
-                                    st.session_state.data_loaded = True
-                                    st.session_state.app_data = {
-                                        'df': df_main, COL_STOK: df_stock,
-                                        COL_MASUK: df_masuk, COL_KELUAR: df_keluar,
-                                        'df_price': df_price
-                                    }
-                                    st.success("Connected & data loaded from DB (manual).")
-                                    st.rerun()
+                                st.session_state.data_loaded = True
+                                st.session_state.app_data = {
+                                    'df': df_main, COL_STOK: df_stock,
+                                    COL_MASUK: df_masuk, COL_KELUAR: df_keluar,
+                                    'df_price': df_price
+                                }
+                                st.rerun()
                     except Exception as e:
-                        # Sanitize error message to user
-                        logger.error(f"Manual DB connection failed: {e}", exc_info=True)
-                        st.error("Koneksi Gagal. Periksa kembali detail koneksi Anda. Pastikan host, port, user, dan password benar.")
-                        st.expander("Detail Error Teknis").exception(e)
-
+                        st.error(f"Koneksi Gagal: {e}")
 
 def render_metrics(df_filtered):
     if df_filtered is None or df_filtered.empty: return
@@ -350,7 +341,7 @@ def render_main_ui():
 
         with col_b:
             fig_balance = create_balance_chart(df_agg, granularity=granularity)
-            clicked_points_balance = plotly_events(fig_balance, click_event=bool(fig_balance.data), key="balance_events", override_height=None, override_width="100%")
+            clicked_points_balance = plotly_events(fig_balance, click_event=bool(fig_balance.data), key="balance_events", override_height=400, override_width="100%")
             handle_drilldown(clicked_points_balance)
 
         st.divider()
@@ -561,11 +552,10 @@ def render_main_ui():
                 else:
                     st.warning("Data tidak cukup untuk regresi.")
 
-    # --- TAB 5: Peramalan (Existing Feature) ---
+   # --- TAB 5: Peramalan (Refactored) ---
     with tabs[4]:
         st.subheader("Peramalan Stok (Forecasting)")
 
-        # Tips memilih algoritma
         st.success("""
         🤖 **Tips Memilih Algoritma:**
         * Pilih **Prophet** jika data Anda memiliki tren jangka panjang yang kuat atau banyak data libur nasional.
@@ -573,64 +563,60 @@ def render_main_ui():
         """)
 
         if len(df_agg) > 10:
-            method = st.radio("Metode", ["Prophet", "Holt-Winters"], horizontal=True)
-            
-            horizon_label = f"Horizon Peramalan ({granularity.replace('an', '')})"
-            days = st.slider(horizon_label, 7, 90, 30)
+            col_met, col_hor = st.columns([1, 2])
+            with col_met:
+                method = st.radio("Metode", ["Prophet", "Holt-Winters"], horizontal=True)
+            with col_hor:
+                horizon_label = f"Horizon Peramalan ({granularity.replace('an', '')})"
+                days = st.slider(horizon_label, 7, 90, 30)
 
-            df_fc = df_agg[[COL_TANGGAL, COL_STOK]].rename(columns={COL_TANGGAL:FC_COL_DS, COL_STOK:FC_COL_Y})
-
-            if len(df_fc) < 14:
-                st.error("Data terlalu sedikit untuk forecasting.")
-                st.stop()
-
+            # --- LOGIKA BARU MENGGUNAKAN LIB/FORECAST.PY ---
             if method == "Prophet":
-                m = Prophet()
-                m.fit(df_fc)
-                future = m.make_future_dataframe(periods=days)
-                forecast = m.predict(future)
+                with st.spinner("Menjalankan model Prophet..."):
+                    df_hist, df_pred = run_prophet_forecast(df_agg, days)
                 
-                fig_fc = go.Figure()
-                fig_fc.add_trace(go.Scatter(x=df_fc[FC_COL_DS], y=df_fc[FC_COL_Y], name='Historis'))
-                fig_fc.add_trace(go.Scatter(x=forecast[FC_COL_DS], y=forecast['yhat'], name='Forecast'))
-                fig_fc.add_trace(go.Scatter(x=forecast[FC_COL_DS], y=forecast['yhat_upper'], fill=None, mode='lines', line_color='lightgrey', showlegend=False))
-                fig_fc.add_trace(go.Scatter(x=forecast[FC_COL_DS], y=forecast['yhat_lower'], fill='tonexty', mode='lines', line_color='lightgrey', name='Confidence Interval'))
+                # Plotting menggunakan lib/plots.py
+                fig_fc = create_forecast_chart(df_hist, df_pred, method="Prophet")
                 st.plotly_chart(fig_fc, use_container_width=True, key="prophet_forecast_chart")
 
-                output_prophet = forecast[[FC_COL_DS, 'yhat', 'yhat_lower', 'yhat_upper']].rename(
-                    columns={'ds':'tanggal', 'yhat':'prediksi', 'yhat_lower': 'Batas Bawah', 'yhat_upper': 'Batas Atas'}    
+                # Persiapan Data Download
+                output_csv = df_pred[[FC_COL_DS, 'yhat', 'yhat_lower', 'yhat_upper']].rename(
+                    columns={FC_COL_DS:'tanggal', 'yhat':'prediksi', 'yhat_lower': 'Batas Bawah', 'yhat_upper': 'Batas Atas'}    
                 )
-                csv_fc = convert_df_to_csv(output_prophet)
+                csv_fc = convert_df_to_csv(output_csv)
+                fname = 'hasil_peramalan_prophet.csv'
+                
 
+            else: # Holt-Winters
+                with st.spinner("Menjalankan model Holt-Winters..."):
+                    df_hist, df_pred = run_holtwinters_forecast(df_agg, days)
+                
+                if df_pred is not None:
+                    # Plotting menggunakan lib/plots.py
+                    fig_fc = create_forecast_chart(df_hist, df_pred, method="Holt-Winters")
+                    st.plotly_chart(fig_fc, use_container_width=True, key="holtwinters_forecast_chart")
+                    
+                    # Persiapan Data Download
+                    output_csv = df_pred.rename(columns={FC_COL_DS:'tanggal', 'yhat':'prediksi'})
+                    csv_fc = convert_df_to_csv(output_csv)
+                    fname = 'hasil_peramalan_holtwinters.csv'
+                    
+                else:
+                    st.error("Gagal menjalankan peramalan Holt-Winters. Data mungkin tidak cukup atau pola tidak sesuai.")
+                    csv_fc = None
+
+            # Tombol Download (Konsisten untuk kedua metode)
+            if csv_fc:
                 st.download_button(
-                    label=" Download Data Peramalan (CSV)",
+                    label="📥 Download Data Peramalan (CSV)",
                     data=csv_fc,
-                    file_name='hasil_preamalan_prophet.csv',
+                    file_name=fname,
                     mime='text/csv',
                     key='download_fc'
                 )
-
-            else: # Holt Winters
-                try:
-                    # Ensure there's enough data for the seasonal period
-                    season = 7 if len(df_fc) >= 14 else (len(df_fc) // 2 if len(df_fc) > 2 else None)
-                    model = ExponentialSmoothing(df_fc[FC_COL_Y], seasonal='add' if season else None, seasonal_periods=season).fit()
-                    pred = model.forecast(days)
-                    
-                    # Create date range for forecast
-                    last_date = df_fc[FC_COL_DS].iloc[-1]
-                    date_range = pd.date_range(last_date, periods=days+1)[1:]
-                    
-                    fig_hw = go.Figure()
-                    fig_hw.add_trace(go.Scatter(x=df_fc[FC_COL_DS], y=df_fc[FC_COL_Y], name='Historis'))
-                    fig_hw.add_trace(go.Scatter(x=date_range, y=pred, name='Forecast (HW)'))
-                    st.plotly_chart(fig_hw, use_container_width=True, key="holtwinters_forecast_chart")
-                except Exception as e:
-                    logger.error(f"Holt-Winters failed: {e}", exc_info=True)
-                    st.error(f"Gagal menjalankan peramalan Holt-Winters. Coba metode Prophet atau periksa data Anda.")
         else:
-            st.warning("Data terlalu sedikit untuk peramalan.")
-
+            st.warning("⚠️ Data terlalu sedikit untuk melakukan peramalan (minimal 10 titik data).")
+            
 def main():
     """Main entry point to run the Streamlit application."""
     if 'data_loaded' not in st.session_state:
