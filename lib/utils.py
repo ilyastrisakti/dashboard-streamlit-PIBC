@@ -3,9 +3,22 @@ import numpy as np
 from typing import Optional, Dict, Any
 from scipy.stats import linregress
 import logging
+import requests
 from .constants import COL_TANGGAL, COL_STOK
 
-def _clean_colname(c: Optional[str]) -> str:
+def load_lottie_url(url: str):
+    """
+    Memuat data animasi lottie (JSON) dari URL.
+    """
+    try:
+        r = requests.get(url)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+        
+def clean_colname(c: Optional[str]) -> str:
     """
     Cleans a column name by removing newlines and stripping whitespace.
     Returns an empty string if the input is None.
@@ -22,7 +35,7 @@ def price_df_with_tanggal(df_price: Optional[pd.DataFrame]) -> Optional[pd.DataF
     if df_price is None:
         return None
     p = df_price.copy()
-    p.columns = [_clean_colname(c) for c in p.columns]
+    p.columns = [clean_colname(c) for c in p.columns]
     if isinstance(p.index, pd.DatetimeIndex) or (p.index.name and str(p.index.name).lower() == COL_TANGGAL):
         p = p.reset_index()
         if 'index' in p.columns:
@@ -55,6 +68,8 @@ def calculate_regression(df_stock: pd.DataFrame, df_price: pd.DataFrame, rice_ty
 
     if COL_TANGGAL not in df_stock.columns:
         df_stock = df_stock.reset_index()
+        if df_stock.empty:
+            return None
         if df_stock.columns[0].lower() != COL_TANGGAL:
             df_stock = df_stock.rename(columns={df_stock.columns[0]: COL_TANGGAL})
 
