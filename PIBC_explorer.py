@@ -7,6 +7,8 @@ import pandas as pd
 import streamlit as st
 from streamlit_option_menu import option_menu
 from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
+
 import gc 
 from streamlit_lottie import st_lottie
 
@@ -232,7 +234,7 @@ def render_main_ui():
     df_p_filt = df_price[mask(df_price.index.date)] if df_price is not None and not df_price.empty else None
 
     # --- Header ---
-    st.markdown("<div class='main-title'>Dashboard Analisis PIBC</div>", unsafe_allow_html=True)
+    st.markdown("<div class='main-title'>Dashboard Analisis PIBvC</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='sub-title'>Periode: {start_date.strftime('%d %b %Y')} s/d {end_date.strftime('%d %b %Y')} | Mode: {granularity}</div>", unsafe_allow_html=True)
 
     render_metrics(df_agg, df_prev)

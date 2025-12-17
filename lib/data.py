@@ -10,142 +10,209 @@ from .constants import *
 
 @st.cache_data
 def get_geo_lookup():
+    # Menambahkan koordinat default dan variasi nama lokasi
     geo_data = {
-        COL_LOKASI: ['Bandung', 'Banten', 'Bekasi', 'Bogor', 'Bulog', 'Cianjur', 
-                   'Cirebon', 'DKI', 'Jateng', 'Jatim', 'Karawang', 'Tangerang', 'Tj Priok'],
-        'lat': [-6.9175, -6.1200, -6.2383, -6.5950, -6.2568, -6.8207, 
-                -6.7061, -6.1751, -6.9667, -7.2575, -6.3290, -6.1781, -6.1044],
-        'lon': [107.6191, 106.1518, 106.9756, 106.7997, 106.8431, 107.1432, 
-                108.5570, 106.8272, 110.4167, 112.7521, 107.3007, 106.6300, 106.8835]
+        COL_LOKASI: [
+            'Bandung', 'Banten', 'Bekasi', 'Bogor', 'Bulog', 'Cianjur', 
+            'Cirebon', 'DKI', 'Jateng', 'Jatim', 'Karawang', 'Tangerang', 
+            'Tj Priok', 'Luar Jawa', 'Luar Pulau Jawa', 'Sulawesi', 'Lampung',
+            'Demak', 'Indramayu', 'Sragen', 'Solo', 'Yogya', 'Semarang' # Tambahan umum
+        ],
+        'lat': [
+            -6.9175, -6.1200, -6.2383, -6.5950, -6.2568, -6.8207, 
+            -6.7061, -6.1751, -6.9667, -7.2575, -6.3290, -6.1781, 
+            -6.1044, -5.5000, -5.5000, -5.5000, -5.5000,
+            -6.8909, -6.3276, -7.4278, -7.5755, -7.7955, -7.0051
+        ],
+        'lon': [
+            107.6191, 106.1518, 106.9756, 106.7997, 106.8431, 107.1432, 
+            108.5570, 106.8272, 110.4167, 112.7521, 107.3007, 106.6300, 
+            106.8835, 110.0000, 110.0000, 110.0000, 105.266,
+            110.6396, 108.3198, 111.0189, 110.8243, 110.3695, 110.4381
+        ]
     }
     return pd.DataFrame(geo_data)
 
 @st.cache_resource(ttl=3600)
 def init_connection():
     try:
-        # Coba ambil dari secrets
         if "connections" in st.secrets and "mysql_db" in st.secrets["connections"]:
             db_config = st.secrets["connections"]["mysql_db"]
             conn = (f"mysql+mysqlconnector://{db_config['username']}:{db_config['password']}@"
                     f"{db_config['host']}:{db_config['port']}/{db_config['database']}")
             return create_engine(conn)
         return None
-    except Exception:
+    except Exception as e:
+        print(f"Database Connection Error: {e}")
         return None
 
 @st.cache_data(ttl=600)
 def load_data_from_db(_engine, start_date: Optional[datetime.date] = None, end_date: Optional[datetime.date] = None) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """
-    Memuat data dari database dengan strategi MULTI-QUERY yang disesuaikan dengan skema db_pibc_olap.
-    """
     if _engine is None: return None, None, None, None, None
 
     params = {}
-    date_filter = ""
     
-    # OPTIMASI: Filter langsung menggunakan integer SK (YYYYMMDD) agar cepat
-    if start_date and end_date:
-        start_sk = int(start_date.strftime('%Y%m%d'))
-        end_sk = int(end_date.strftime('%Y%m%d'))
-        date_filter = "AND d.SK BETWEEN :start_sk AND :end_sk"
-        params['start_sk'] = start_sk
-        params['end_sk'] = end_sk
+    # Kita tidak memfilter di WHERE SQL untuk tanggal, 
+    # karena kita perlu menangani kasus dimana dim_date NULL.
+    # Filtering dilakukan di Python level agar lebih aman.
+    
+    # Helper: Parsing tanggal darurat (dari SK Integer)
+    def _parse_sk_date(df, sk_col='SK_DATE'):
+        if df.empty: return df
+        # 1. Coba ambil dari kolom Year/Month/Day hasil join (jika ada)
+        if 'YEAR' in df.columns and 'MONTH' in df.columns and 'DAY' in df.columns:
+             # Buat tanggal temporary
+             df['temp_date'] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]].rename(columns={"YEAR": "year", "MONTH": "month", "DAY": "day"}), errors="coerce")
+        else:
+             df['temp_date'] = pd.NaT
+
+        # 2. Jika temp_date NaT (karena join gagal), parse langsung dari SK (misal 20240101)
+        # Pastikan SK_DATE string agar bisa diparsing
+        df[sk_col] = df[sk_col].astype(str)
+        mask_nat = df['temp_date'].isna()
+        
+        # Coba format YYYYMMDD
+        df.loc[mask_nat, COL_TANGGAL] = pd.to_datetime(df.loc[mask_nat, sk_col], format='%Y%m%d', errors='coerce')
+        # Isi sisanya dengan temp_date
+        df.loc[~mask_nat, COL_TANGGAL] = df.loc[~mask_nat, 'temp_date']
+        
+        # Drop helper
+        if 'temp_date' in df.columns: df.drop(columns=['temp_date'], inplace=True)
+        return df
 
     try:
         with _engine.connect() as conn:
-            # 1. QUERY STOK & NERACA UTAMA
-            # Mengambil dari fact_rice_income_outcome yang sudah diagregasi
+            # ==========================================
+            # 1. QUERY STOK (Global)
+            # ==========================================
             q_stock = text(f"""
                 SELECT 
+                    fio.SK_DATE,
                     d.YEAR, d.MONTH, d.DAY,
                     fio.TOTAL_WEIGHT_INCOME AS {COL_MASUK},
                     fio.TOTAL_WEIGHT_OUTCOME AS {COL_KELUAR},
                     fio.WEIGHT_STOCK AS {COL_STOK}
-                FROM dim_date d
-                JOIN fact_rice_income_outcome fio ON d.SK = fio.SK_DATE
-                WHERE 1=1 {date_filter}
-                ORDER BY d.SK
+                FROM fact_rice_income_outcome fio 
+                LEFT JOIN dim_date d ON fio.SK_DATE = d.SK
+                ORDER BY fio.SK_DATE ASC
             """)
             df_main = pd.read_sql(q_stock, conn, params=params)
             
-            if df_main.empty:
-                return None, None, None, None, None
+            if not df_main.empty:
+                df_main = _parse_sk_date(df_main, 'SK_DATE')
+                for c in [COL_MASUK, COL_KELUAR, COL_STOK]:
+                    df_main[c] = pd.to_numeric(df_main[c], errors='coerce').clip(lower=0).fillna(0)
+                df_main[COL_NERACA] = df_main[COL_MASUK] - df_main[COL_KELUAR]
+                df_stock = df_main[[COL_TANGGAL, COL_STOK]].copy()
+            else:
+                df_main, df_stock = pd.DataFrame(), pd.DataFrame()
 
-            # Konversi Tanggal
-            df_main[COL_TANGGAL] = pd.to_datetime(df_main[["YEAR", "MONTH", "DAY"]].rename(columns={"YEAR": "year", "MONTH": "month", "DAY": "day"}), errors="coerce")
-            df_main[COL_NERACA] = df_main[COL_MASUK] - df_main[COL_KELUAR]
-            df_stock = df_main[[COL_TANGGAL, COL_STOK]].copy()
-
-            # 2. QUERY HARGA (Pivot per Jenis Beras)
+            # ==========================================
+            # 2. QUERY HARGA (Per Jenis)
+            # ==========================================
+            # Gunakan COALESCE pada Nama Beras agar jika NULL (ID Beras baru),
+            # dia akan muncul sebagai 'Beras ID [SK]'
             q_price = text(f"""
                 SELECT 
+                    fh.SK_DATE,
                     d.YEAR, d.MONTH, d.DAY,
                     fh.PRICE AS {COL_HARGA},
-                    drt.RICE_TYPE_NAME AS {COL_NAMA_JENIS}
-                FROM dim_date d
-                JOIN fact_harga fh ON d.SK = fh.SK_DATE
-                JOIN dim_rice_type drt ON fh.SK_RICE_TYPE = drt.SK
-                JOIN dim_market dm ON fh.SK_MARKET = dm.SK
-                WHERE dm.MARKET_NAME = 'Pasar Induk Beras Cipinang' 
-                {date_filter}
+                    CASE 
+                        WHEN drt.RICE_TYPE_NAME IS NOT NULL THEN drt.RICE_TYPE_NAME
+                        ELSE CONCAT('Beras ID ', fh.SK_RICE_TYPE) 
+                    END AS {COL_NAMA_JENIS}
+                FROM fact_harga fh 
+                LEFT JOIN dim_date d ON fh.SK_DATE = d.SK
+                LEFT JOIN dim_market dm ON fh.SK_MARKET = dm.SK
+                LEFT JOIN dim_rice_type drt ON fh.SK_RICE_TYPE = drt.SK
+                WHERE 
+                    (dm.MARKET_NAME = 'Pasar Induk Beras Cipinang' OR dm.MARKET_NAME IS NULL)
+                ORDER BY fh.SK_DATE ASC
             """)
+            # Catatan: OR dm.MARKET_NAME IS NULL ditambahkan agar jika Market ID di Fact tidak ketemu di Dim,
+            # data tetap masuk (asumsi data scraping defaultnya Cipinang).
+            
             df_p_raw = pd.read_sql(q_price, conn, params=params)
+            df_price = pd.DataFrame()
             
             if not df_p_raw.empty:
-                df_p_raw[COL_TANGGAL] = pd.to_datetime(df_p_raw[["YEAR", "MONTH", "DAY"]].rename(columns={"YEAR": "year", "MONTH": "month", "DAY": "day"}), errors="coerce")
-                # Pivot agar nama beras jadi kolom
-                df_price = df_p_raw.pivot_table(index=COL_TANGGAL, columns=COL_NAMA_JENIS, values=COL_HARGA, aggfunc='mean')
-            else:
-                df_price = pd.DataFrame()
+                df_p_raw = _parse_sk_date(df_p_raw, 'SK_DATE')
+                df_p_raw = df_p_raw.dropna(subset=[COL_TANGGAL]) # Hapus jika tanggal benar-benar gagal diparsing
+                df_p_raw[COL_HARGA] = pd.to_numeric(df_p_raw[COL_HARGA], errors='coerce').replace(0, np.nan)
+                
+                df_price = df_p_raw.pivot_table(
+                    index=COL_TANGGAL, 
+                    columns=COL_NAMA_JENIS, 
+                    values=COL_HARGA, 
+                    aggfunc='mean' # type: ignore
+                ).fillna(method='ffill', limit=3) # type: ignore
 
-            # 3. QUERY PETA MASUK (Supply)
-            # PERBAIKAN: Menggunakan kolom 'WEIGHT' (bukan TOTAL_WEIGHT) sesuai tabel fact_rice_income
+            # ==========================================
+            # 3. QUERY MASUK (Per Lokasi)
+            # ==========================================
             q_masuk = text(f"""
                 SELECT 
+                    fri.SK_DATE,
                     d.YEAR, d.MONTH, d.DAY,
-                    dp.PLACE_NAME AS {COL_LOKASI},
+                    CASE 
+                        WHEN dp.PLACE_NAME IS NOT NULL THEN dp.PLACE_NAME
+                        ELSE CONCAT('Lokasi ID ', fri.SK_PLACE) 
+                    END AS {COL_LOKASI},
                     fri.WEIGHT AS {COL_MASUK} 
-                FROM dim_date d
-                JOIN fact_rice_income fri ON d.SK = fri.SK_DATE
-                JOIN dim_place dp ON fri.SK_PLACE = dp.SK
-                WHERE 1=1 {date_filter}
+                FROM fact_rice_income fri
+                LEFT JOIN dim_date d ON fri.SK_DATE = d.SK
+                LEFT JOIN dim_place dp ON fri.SK_PLACE = dp.SK
+                ORDER BY fri.SK_DATE ASC
             """)
             df_masuk_long = pd.read_sql(q_masuk, conn, params=params)
             
             if not df_masuk_long.empty:
-                df_masuk_long[COL_TANGGAL] = pd.to_datetime(df_masuk_long[["YEAR", "MONTH", "DAY"]].rename(columns={"YEAR": "year", "MONTH": "month", "DAY": "day"}), errors="coerce")
+                df_masuk_long = _parse_sk_date(df_masuk_long, 'SK_DATE')
                 df_masuk_long[COL_LOKASI_NORM] = df_masuk_long[COL_LOKASI].astype(str).str.strip().str.lower()
             else:
                 df_masuk_long = pd.DataFrame(columns=[COL_TANGGAL, COL_LOKASI, COL_LOKASI_NORM, COL_MASUK])
 
-            # 4. QUERY PETA KELUAR (Distribution)
-            # PERBAIKAN: Menggunakan kolom 'WEIGHT' (bukan TOTAL_WEIGHT) sesuai tabel fact_rice_outcome
+            # ==========================================
+            # 4. QUERY KELUAR (Per Lokasi)
+            # ==========================================
             q_keluar = text(f"""
                 SELECT 
+                    fro.SK_DATE,
                     d.YEAR, d.MONTH, d.DAY,
-                    dp.PLACE_NAME AS {COL_LOKASI},
+                    CASE 
+                        WHEN dp.PLACE_NAME IS NOT NULL THEN dp.PLACE_NAME
+                        ELSE CONCAT('Lokasi ID ', fro.SK_PLACE) 
+                    END AS {COL_LOKASI},
                     fro.WEIGHT AS {COL_KELUAR}
-                FROM dim_date d
-                JOIN fact_rice_outcome fro ON d.SK = fro.SK_DATE
-                JOIN dim_place dp ON fro.SK_PLACE = dp.SK
-                WHERE 1=1 {date_filter}
+                FROM fact_rice_outcome fro
+                LEFT JOIN dim_date d ON fro.SK_DATE = d.SK
+                LEFT JOIN dim_place dp ON fro.SK_PLACE = dp.SK
+                ORDER BY fro.SK_DATE ASC
             """)
             df_keluar_long = pd.read_sql(q_keluar, conn, params=params)
 
             if not df_keluar_long.empty:
-                df_keluar_long[COL_TANGGAL] = pd.to_datetime(df_keluar_long[["YEAR", "MONTH", "DAY"]].rename(columns={"YEAR": "year", "MONTH": "month", "DAY": "day"}), errors="coerce")
+                df_keluar_long = _parse_sk_date(df_keluar_long, 'SK_DATE')
                 df_keluar_long[COL_LOKASI_NORM] = df_keluar_long[COL_LOKASI].astype(str).str.strip().str.lower()
             else:
                 df_keluar_long = pd.DataFrame(columns=[COL_TANGGAL, COL_LOKASI, COL_LOKASI_NORM, COL_KELUAR])
 
+            # 5. FILTER TANGGAL AKHIR (DI PYTHON)
+            # Karena kita melepas filter SQL, kita filter di sini
+            if start_date and end_date:
+                s = pd.to_datetime(start_date)
+                e = pd.to_datetime(end_date) + pd.Timedelta(days=1) # Include end date
+                
+                if not df_main.empty: df_main = df_main[(df_main[COL_TANGGAL] >= s) & (df_main[COL_TANGGAL] <= e)]
+                if not df_stock.empty: df_stock = df_stock[(df_stock[COL_TANGGAL] >= s) & (df_stock[COL_TANGGAL] <= e)]
+                if not df_price.empty: df_price = df_price[(df_price.index >= s) & (df_price.index <= e)]
+                if not df_masuk_long.empty: df_masuk_long = df_masuk_long[(df_masuk_long[COL_TANGGAL] >= s) & (df_masuk_long[COL_TANGGAL] <= e)]
+                if not df_keluar_long.empty: df_keluar_long = df_keluar_long[(df_keluar_long[COL_TANGGAL] >= s) & (df_keluar_long[COL_TANGGAL] <= e)]
+
             return df_main, df_stock, df_masuk_long, df_keluar_long, df_price
 
-    except ImportError:
-        st.error("Library `mysql-connector-python` belum diinstall. Jalankan `pip install mysql-connector-python`")
-        return None, None, None, None, None
     except Exception as e:
-        # Tampilkan error detail untuk debugging
-        st.error(f"⚠️ Terjadi kesalahan Database: {str(e)}")
+        st.error(f"⚠️ Error Database: {str(e)}")
         return None, None, None, None, None
 
 @st.cache_data(ttl=3600)
@@ -153,7 +220,6 @@ def preprocess_data_from_excel(uploaded_file) -> Tuple[Optional[pd.DataFrame], O
     """Memproses file Excel menjadi DataFrame."""
     if uploaded_file is None: return None, None, None, None, None
     
-    # Reset pointer file (Penting untuk menghindari file terbaca kosong)
     try: uploaded_file.seek(0)
     except: pass
     
