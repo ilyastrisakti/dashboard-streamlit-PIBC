@@ -25,7 +25,15 @@ def _ensure_fig_template(fig: go.Figure, template: Optional[str]):
     return fig
 
 
-def create_time_series(df: pd.DataFrame, y_col: str, title: str, color: Optional[str] = None, template: Optional[str] = None, is_daily: bool = True) -> go.Figure:
+def create_time_series(
+    df: pd.DataFrame, 
+    y_col: str, 
+    title: str, 
+    color: Optional[str] = None, 
+    template: Optional[str] = None, 
+    is_daily: bool = True,
+    unit: str = "Ton"  # <--- TAMBAHKAN PARAMETER INI (Default "Ton")
+) -> go.Figure:
     """
     Creates a line/area chart for a single time-series column with range slider.
     """
@@ -46,16 +54,16 @@ def create_time_series(df: pd.DataFrame, y_col: str, title: str, color: Optional
     # Styling area gradient & markers
     if fig.data:
         line_color = fig.data[0].line.color
-        # Create semi-transparent fill
         fill_color = f"rgba({int(line_color[1:3], 16)}, {int(line_color[3:5], 16)}, {int(line_color[5:7], 16)}, 0.1)" if line_color and '#' in line_color else "rgba(0,0,0,0.1)"
         
+        # UPDATE HOVER TEMPLATE: Menggunakan variabel 'unit'
         fig.update_traces(
             fillcolor=fill_color,
             mode='lines' if is_daily else 'lines+markers',
-            hovertemplate='%{x|%d %b %Y}<br><b>%{y:,.0f} Ton</b><extra></extra>'
+            hovertemplate=f'%{{x|%d %b %Y}}<br><b>%{{y:,.0f}} {unit}</b><extra></extra>'
         )
 
-    # Add Range Slider
+    # Add Range Slider & Layout
     fig.update_xaxes(
         rangeslider_visible=True,
         rangeselector=dict(
@@ -74,7 +82,7 @@ def create_time_series(df: pd.DataFrame, y_col: str, title: str, color: Optional
     fig.update_layout(
         margin={"r":10,"t":50,"l":10,"b":10},
         hovermode="x unified",
-        yaxis_title=None,
+        yaxis_title=unit, # Opsional: Tampilkan satuan di sumbu Y juga
         xaxis_title=None
     )
     return fig
@@ -287,27 +295,126 @@ def create_geo_map(df_flow: pd.DataFrame, geo_lookup: pd.DataFrame, flow_type: s
     return go.Figure() 
 
 def create_pydeck_map(df_agg: pd.DataFrame, flow_type: str = "masuk") -> pdk.Deck:
-    # ... (Sama seperti kode sebelumnya, gunakan PyDeck) ...
-    if df_agg is None or df_agg.empty: return None # type: ignore
+    """
+    Membuat Peta 3D PyDeck dengan visualisasi arus barang.
+    Fitur:
+    - Warna Emas untuk 'Luar Pulau Jawa'.
+    - Ketebalan garis dinamis (Volume kecil = Tipis).
+    - Tooltip yang mudah dibaca.
+    """
+    # 1. Guard Clause (Cek Data Kosong)
+    if df_agg is None or df_agg.empty: 
+        return None 
     
+    # 2. Inisialisasi DataFrame (PENTING: Fix UnboundLocalError)
+    df = df_agg.copy()
+    
+    # 3. Setup Koordinat Pusat (PIBC Cipinang)
     pibc_lat, pibc_lon = -6.218, 106.896
-    df_agg['target_lat'] = pibc_lat
-    df_agg['target_lon'] = pibc_lon
+    df['target_lat'] = pibc_lat
+    df['target_lon'] = pibc_lon
     
-    max_val = df_agg[flow_type].max()
-    df_agg['normalized_elevation'] = (df_agg[flow_type] / max_val) * 50000 if max_val > 0 else 0
-    df_agg['normalized_width'] = (df_agg[flow_type] / max_val) * 10 if max_val > 0 else 1
-    
-    source_color = [0, 255, 150, 160] if flow_type == "masuk" else [255, 100, 100, 160]
-    target_color = [0, 150, 255, 160] if flow_type == "masuk" else [255, 180, 0, 160]
+    # 4. Normalisasi Visual (Ketebalan & Tinggi)
+    max_val = df[flow_type].max()
+    if max_val == 0: max_val = 1 # Hindari pembagian dengan nol
 
-    arc_layer = pdk.Layer("ArcLayer", data=df_agg, get_source_position=["lon", "lat"], get_target_position=["target_lon", "target_lat"], get_source_color=source_color, get_target_color=target_color, get_width="normalized_width + 2", get_tilt=15, pickable=True, auto_highlight=True)
-    column_layer = pdk.Layer("ColumnLayer", data=df_agg, get_position=["lon", "lat"], get_elevation="normalized_elevation", elevation_scale=1, radius=2000, get_fill_color=source_color, pickable=True, extruded=True)
-    pibc_layer = pdk.Layer("ScatterplotLayer", data=pd.DataFrame([{'name': 'PIBC', 'lat': pibc_lat, 'lon': pibc_lon}]), get_position=["lon", "lat"], get_color=[255, 255, 255, 200], get_radius=3000, pickable=True)
-
-    tooltip = {"html": f"<b>Lokasi:</b> {{lokasi_lookup}}<br/><b>Volume:</b> {{{flow_type}}} Ton", "style": {"backgroundColor": "steelblue", "color": "white"}}
+    # Lebar garis: Minimal 1.5 pixel, Maksimal 15 pixel
+    df['visual_width'] = (df[flow_type] / max_val) * 15 
+    df['visual_width'] = df['visual_width'].clip(lower=1.5)
     
-    # Map Style logic
+    # Tinggi batang: Maksimal 50km
+    df['visual_elevation'] = (df[flow_type] / max_val) * 50000 
+    
+    # Format angka untuk Tooltip (String)
+    df['formatted_volume'] = df[flow_type].apply(lambda x: f"{x:,.0f}")
+    
+    # 5. Logika Warna (Emas untuk Luar Jawa)
+    def get_color_rgb(row_lokasi, mode):
+        # Deteksi Luar Jawa (Case Insensitive)
+        loc_name = str(row_lokasi).lower()
+        if 'luar' in loc_name and 'jawa' in loc_name:
+            return [255, 215, 0] # GOLD (Emas)
+            
+        # Warna Standar
+        if mode == "masuk":
+            return [0, 255, 150] # Hijau Neon
+        else:
+            return [255, 100, 50] # Merah/Oranye Neon
+
+    # Terapkan Warna ke Kolom DataFrame
+    # Kita pisah R, G, B agar PyDeck mudah membacanya
+    df['c_base'] = df['lokasi_lookup'].apply(lambda x: get_color_rgb(x, flow_type))
+    
+    # Tambahkan Alpha (Transparansi) -> [R, G, B, A]
+    # Arc Source Color (Agak Solid: 200)
+    df['color_source'] = df['c_base'].apply(lambda x: x + [200])
+    
+    # Column Fill Color (Agak Transparan: 150)
+    df['color_fill'] = df['c_base'].apply(lambda x: x + [150])
+
+    # 6. Definisi Layer PyDeck
+    
+    # LAYER 1: Garis Lengkung (Arc)
+    arc_layer = pdk.Layer(
+        "ArcLayer",
+        data=df,
+        get_source_position=["lon", "lat"],
+        get_target_position=["target_lon", "target_lat"],
+        get_source_color="color_source",     # Warna Asal (Hijau/Merah/Emas)
+        get_target_color=[0, 150, 255, 100], # Warna Tujuan (Biru Pudar di PIBC)
+        get_width="visual_width",
+        get_tilt=15,
+        pickable=True,
+        auto_highlight=True,
+    )
+
+    # LAYER 2: Batang Vertikal (Column)
+    column_layer = pdk.Layer(
+        "ColumnLayer",
+        data=df,
+        get_position=["lon", "lat"],
+        get_elevation="visual_elevation",
+        elevation_scale=1,
+        radius=3000,
+        get_fill_color="color_fill",         # Warna Batang
+        pickable=True,
+        extruded=True,
+        auto_highlight=True,
+    )
+
+    # LAYER 3: Marker Pusat (PIBC)
+    pibc_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=pd.DataFrame([{'name': 'PIBC Cipinang', 'lat': pibc_lat, 'lon': pibc_lon}]),
+        get_position=["lon", "lat"],
+        get_color=[255, 255, 255, 255],
+        get_radius=2000,
+        stroked=True,
+        line_width_min_pixels=2,
+        get_line_color=[0, 0, 0],
+        pickable=True
+    )
+
+    # 7. Konfigurasi Tampilan (View & Tooltip)
+    tooltip = {
+        "html": (
+            "<div style='background: rgba(30, 30, 30, 0.9); color: white; padding: 10px; border-radius: 5px; font-family: sans-serif;'>"
+            "<b>{lokasi_lookup}</b><br/>"
+            "<span style='font-size: 1.2em; color: #FFD700;'>{formatted_volume} Ton</span>"
+            "</div>"
+        )
+    }
+    
+    # Kamera sedikit menjauh agar 'Luar Jawa' terlihat nyaman
+    view_state = pdk.ViewState(
+        latitude=-5.5, 
+        longitude=107.0, 
+        zoom=6.2, 
+        pitch=40, 
+        bearing=0
+    )
+
+    # Token Mapbox (Optional)
     mapbox_token = None
     try: mapbox_token = st.secrets["mapbox"]["token"]
     except: pass
@@ -315,8 +422,14 @@ def create_pydeck_map(df_agg: pd.DataFrame, flow_type: str = "masuk") -> pdk.Dec
     map_style = "mapbox://styles/mapbox/dark-v10" if mapbox_token else "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
     api_keys = {"mapbox": mapbox_token} if mapbox_token else None
 
-    return pdk.Deck(layers=[column_layer, arc_layer, pibc_layer], initial_view_state=pdk.ViewState(latitude=-6.5, longitude=107.5, zoom=7, pitch=45), tooltip=tooltip, map_style=map_style, api_keys=api_keys) # type: ignore
-
+    # 8. Render Deck
+    return pdk.Deck(
+        layers=[column_layer, arc_layer, pibc_layer], 
+        initial_view_state=view_state, 
+        tooltip=tooltip, 
+        map_style=map_style, 
+        api_keys=api_keys
+    )
 
 def create_forecast_chart(df_hist: pd.DataFrame, df_pred: pd.DataFrame, method: str = "Prophet", template: Optional[str] = None) -> go.Figure:
     # ... (Sama seperti sebelumnya) ...

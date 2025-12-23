@@ -7,6 +7,7 @@ import streamlit as st
 # Import library forecasting
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from sklearn.metrics import mean_absolute_percentage_error
 
 # Import konstanta internal
 from .constants import FC_COL_DS, FC_COL_Y, COL_TANGGAL, COL_STOK
@@ -14,7 +15,7 @@ from .constants import FC_COL_DS, FC_COL_Y, COL_TANGGAL, COL_STOK
 logger = logging.getLogger(__name__)
 
 @st.cache_data(show_spinner=True)
-def run_prophet_forecast(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def run_prophet_forecast(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     """
     Menjalankan algoritma Prophet untuk peramalan stok.
     Mengembalikan tuple: (DataFrame Historis, DataFrame Hasil Forecast)
@@ -25,12 +26,16 @@ def run_prophet_forecast(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, 
     # 2. Inisialisasi dan Fitting Model
     m = Prophet()
     m.fit(df_fc)
+   
+    # Tambahan: Hitung error pada data training (In-sample evaluation)
+    prediction_on_train = m.predict(df_fc)
+    mape = mean_absolute_percentage_error(df_fc['y'], prediction_on_train['yhat'])
     
     # 3. Prediksi
     future = m.make_future_dataframe(periods=periods)
     forecast = m.predict(future)
     
-    return df_fc, forecast
+    return df_fc, forecast, mape
 
 @st.cache_data(show_spinner=True)
 def run_holtwinters_forecast(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:

@@ -8,6 +8,11 @@ import streamlit as st
 from streamlit_option_menu import option_menu
 from sqlalchemy import create_engine
 from sqlalchemy.exc import SQLAlchemyError
+from streamlit_extras.metric_cards import style_metric_cards
+from streamlit_extras.colored_header import colored_header
+from streamlit_extras.dataframe_explorer import dataframe_explorer
+from streamlit_extras.badges import badge
+
 
 import gc 
 from streamlit_lottie import st_lottie
@@ -193,6 +198,13 @@ def render_metrics(df_curr, df_prev):
     c4.metric("⚖️ Net Neraca", f"{curr_neraca:,.0f} Ton", "Surplus" if curr_neraca > 0 else "Defisit", 
               delta_color="normal" if curr_neraca > 0 else "inverse", help="Selisih Masuk - Keluar")
     st.markdown("---")
+    
+    style_metric_cards(
+        background_color="#8D6F64",
+        border_left_color="#2E86AB",
+        border_color="#E0E0E0",
+        box_shadow=True
+    )
 
 def render_main_ui():
     with st.spinner("🚀 Menghubungkan ke Data..."):
@@ -252,7 +264,7 @@ def render_main_ui():
             st.divider()
             df_p_agg = df_p_filt[[selected_rice]].resample('M' if granularity=='Bulanan' else 'Y').mean() if not is_daily else df_p_filt[[selected_rice]]
             st.markdown(f"#### 🏷️ Tren Harga: {selected_rice}")
-            st.plotly_chart(create_time_series(df_p_agg.reset_index(), selected_rice, f"Harga {selected_rice}", "#2E86AB", is_daily=is_daily), use_container_width=True)
+            st.plotly_chart(create_time_series(df_p_agg.reset_index(), selected_rice, f"Harga {selected_rice}", "#2E86AB", is_daily=is_daily, unit="Rp"), use_container_width=True)
 
     # TAB 2: PETA
     with tabs[1]:
@@ -268,12 +280,83 @@ def render_main_ui():
         if not df_map.empty:
             deck = create_pydeck_map(df_map, col_target)
             st.pydeck_chart(deck)
-            with st.expander(f"📋 Data Tabel {view}"): st.dataframe(df_map.sort_values(col_target, ascending=False), use_container_width=True)
+            # --- BAGIAN MODIFIKASI TABEL ---
+            with st.expander(f"📋 Rincian Data {view}", expanded=True):
+                
+                # 1. Buat copy biar dataframe asli (untuk peta) tidak rusak
+                df_display = df_map.copy()
+
+                # --- [DEBUG] CEK TOTAL SEBELUM FILTER ---
+                total_raw = df_display[col_target].sum()
+
+                # Cari baris yang nilainya mencurigakan (Sangat besar > 10% total)
+                suspects = df_display[df_display[col_target] > (total_raw * 0.1)]
+
+                # Jika user mau melihat data mentah penyebab error
+                if st.checkbox("🔍 Debug Mode (Cek Total Aneh)"):
+                    st.write(f"Total Volume Mentah: {total_raw:,.0f}")
+                    st.write("Tersangka Baris 'Raksasa' (Rekapitulasi?):")
+                    st.dataframe(suspects)
+                
+                # --- [FIX] FILTER BARIS SAMPAH/REKAP ---
+                # Buang baris yang namanya mengandung kata 'Total', 'Jumlah', 'Grand', atau kosong
+                blacklist = ['total', 'jumlah', 'grand total', 'rekap', 'all', 'nan', 'unknown']
+                
+                # Filter baris blacklist
+                mask_clean = ~df_display['lokasi_lookup'].astype(str).str.lower().isin(blacklist)
+                df_display = df_display[mask_clean]
+
+                # Opsional: Buang juga baris yang nilainya SANGAT BESAR (Misal > 50% dari total raw, biasanya itu Grand Total)
+                # Logika: Jika satu baris sendirian menguasai > 80% total raw, kemungkinan itu baris Total.
+                if not df_display.empty:
+                    max_val = df_display[col_target].max()
+                    if max_val > (total_raw * 0.9): 
+                        df_display = df_display[df_display[col_target] != max_val]
+                
+                # 2. Hapus kolom teknis
+                df_display = df_display.drop(columns=['lat', 'lon', 'normalized_elevation', 'normalized_width', 'target_lat', 'target_lon'], errors='ignore')
+                
+                # 3. Hitung Persentase Kontribusi (KALIKAN 100 DI SINI)
+                total_clean = df_display[col_target].sum()
+                # Ubah logic ini: dikali 100 agar jadi angka puluhan (misal: 26.3)
+                df_display["Kontribusi"] = ((df_display[col_target] / total_clean) * 100) if total_clean > 0 else 0
+                
+                # 4. Rename & Display
+                df_display = df_display.rename(columns={
+                    "lokasi_lookup": "Daerah Asal/Tujuan",
+                    col_target: "Volume (Ton)"
+                })
+                
+                st.dataframe(
+                    df_display.sort_values("Volume (Ton)", ascending=False),
+                    column_config={
+                        "Volume (Ton)": st.column_config.NumberColumn(
+                            "Volume (Ton)",
+                            format="%d Ton",
+                        ),
+                        "Kontribusi": st.column_config.ProgressColumn(
+                            "Kontribusi (%)",
+                            format="%.1f%%",   # Format akan menampilkan "26.3%"
+                            min_value=0,
+                            max_value=100,     # <--- PENTING: Ubah Max jadi 100
+                        ),
+                        "Daerah Asal/Tujuan": st.column_config.TextColumn(
+                            "Daerah Asal/Tujuan",
+                            width="medium"
+                        )
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
         else: st.warning("Data kosong untuk periode ini.")
 
     # TAB 3: ANALISIS
     with tabs[2]:
-        st.subheader("🔍 Kestabilan Stok")
+        colored_header(
+        label="🔍 Kestabilan Stok",
+        description="Analisis volatilitas dan ketahanan gudang",
+        color_name="blue-70", # Pilihan warna: 'red-70', 'violet-70', dll
+    )
         with st.expander(TXT_ANALYSIS_HEADER, expanded=True): st.markdown(TXT_ANALYSIS_BODY)
         if is_daily:
             c1, c2 = st.columns([3, 1])
@@ -294,7 +377,7 @@ def render_main_ui():
             st.divider()
             st.plotly_chart(create_price_heatmap(df_p_filt, correlation=True), use_container_width=True)
 
-    # TAB 4: STATISTIK (ENHANCED)
+    # TAB 4: STATISTIK
     with tabs[3]:
         # Header Section
         c_head1, c_head2 = st.columns([3, 1])
@@ -324,6 +407,11 @@ def render_main_ui():
             stab_label = "Stabil" if s_cv < 10 else ("Sedang" if s_cv < 20 else "Labil")
             k4.metric("Stabilitas Stok", stab_label, f"Var: {s_cv:.1f}%", delta_color="inverse" if s_cv > 20 else "normal")
 
+            if stab_label == "Stabil":
+                badge(type="github", name="Pass") # Hijau
+            elif stab_label == "Labil":
+                badge(type="pypi", name="Warning") # Merah/Kuning
+            
             st.plotly_chart(create_stock_distribution(df_agg), use_container_width=True)
         else: st.warning("Data stok tidak tersedia.")
 
@@ -357,6 +445,15 @@ def render_main_ui():
                     st.plotly_chart(create_regression_scatter(reg['df'], COL_STOK, selected_rice), use_container_width=True)
             else: st.warning("Data tidak cukup untuk regresi.")
         else: st.info("👈 Pilih Jenis Beras di Sidebar.")
+
+        # --- BAGIAN 3: DOWNLOAD ---
+        csv_data = convert_df_to_csv(df_agg)
+        st.download_button(
+            label="📥 Download Data Terolah (.csv)",
+            data=csv_data,
+            file_name=f"laporan_pibc_{start_date}_{end_date}.csv",
+            mime='text/csv',
+        )
 
     # TAB 5: PERAMALAN
     with tabs[4]:
